@@ -55,13 +55,20 @@
 #include <pcl/io/pcd_io.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
-#include <std_srvs/srv/trigger.hpp>
+#include "std_srvs/srv/trigger.hpp"
+#include "fast_lio/srv/load_map.hpp"
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <pcl/registration/icp.h>
+#include <iomanip>
+#include <sstream>
+#include "scan_context.h"
+#include <filesystem>  // Add this include for std::filesystem
+#include <sensor_msgs/msg/laser_scan.hpp>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -142,6 +149,28 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+bool relocalization_mode; 
+bool periodic_save;
+double save_interval;
+std::vector<double> initial_pose;
+std::vector<PoseInfo> path_record;
+
+rclcpp::TimerBase::SharedPtr map_save_timer_;
+rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_map_service_;
+rclcpp::Service<fast_lio::srv::LoadMap>::SharedPtr load_map_service_;
+
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubGlobalMap_;
+rclcpp::TimerBase::SharedPtr global_map_timer_;
+
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
+rclcpp::TimerBase::SharedPtr local_map_timer_;
+PointCloudXYZI::Ptr accumulated_cloud_;
+rclcpp::Time last_local_map_time_;
+std::mutex local_map_mutex_;
+std::deque<std::pair<rclcpp::Time, PointCloudXYZI::Ptr>> timed_cloud_queue_; // Queue to store clouds with timestamps
+
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
 
 void SigHandle(int sig)
 {
@@ -435,6 +464,9 @@ bool sync_packages(MeasureGroup &meas)
 }
 
 int process_increments = 0;
+bool suppress_point_warnings = false; // Add this flag to control warnings
+int warning_counter = 0; // Counter for reducing warning frequency
+int info_message_counter = 0; // Counter for reducing normal info messages
 void map_incremental()
 {
     PointVector PointToAdd;
@@ -445,31 +477,30 @@ void map_incremental()
     {
         /* transform to world frame */
         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+        
+        /* Skip points marked by dynamic filtering */
+        if (!point_selected_surf[i]) {
+            continue; // Skip points marked as dynamic or outside valid height range
+        }
+        
         /* decide if need add to map */
         if (!Nearest_Points[i].empty() && flg_EKF_inited)
         {
             const PointVector &points_near = Nearest_Points[i];
             bool need_add = true;
-            BoxPointType Box_of_Point;
-            PointType downsample_result, mid_point; 
-            mid_point.x = floor(feats_down_world->points[i].x/filter_size_map_min)*filter_size_map_min + 0.5 * filter_size_map_min;
-            mid_point.y = floor(feats_down_world->points[i].y/filter_size_map_min)*filter_size_map_min + 0.5 * filter_size_map_min;
-            mid_point.z = floor(feats_down_world->points[i].z/filter_size_map_min)*filter_size_map_min + 0.5 * filter_size_map_min;
-            float dist  = calc_dist(feats_down_world->points[i],mid_point);
-            if (fabs(points_near[0].x - mid_point.x) > 0.5 * filter_size_map_min && fabs(points_near[0].y - mid_point.y) > 0.5 * filter_size_map_min && fabs(points_near[0].z - mid_point.z) > 0.5 * filter_size_map_min){
-                PointNoNeedDownsample.push_back(feats_down_world->points[i]);
-                continue;
-            }
-            for (int readd_i = 0; readd_i < NUM_MATCH_POINTS; readd_i ++)
-            {
-                if (points_near.size() < NUM_MATCH_POINTS) break;
-                if (calc_dist(points_near[readd_i], mid_point) < dist)
-                {
+            
+            // Relax the condition for filtering points
+            if (points_near.size() >= 5) {
+                // Check the distance to the nearest point
+                float dist = calc_dist(feats_down_world->points[i], points_near[0]);
+                if (dist < 0.05) {  // Reduced from 0.1 to 0.05
                     need_add = false;
-                    break;
                 }
             }
-            if (need_add) PointToAdd.push_back(feats_down_world->points[i]);
+            
+            if (need_add) {
+                PointToAdd.push_back(feats_down_world->points[i]);
+            }
         }
         else
         {
@@ -482,6 +513,25 @@ void map_incremental()
     ikdtree.Add_Points(PointNoNeedDownsample, false); 
     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     kdtree_incremental_time = omp_get_wtime() - st_time;
+
+    warning_counter++;
+    info_message_counter++;
+    
+    if (feats_down_size > add_point_size/2 && !suppress_point_warnings && warning_counter >= 50)
+    {
+        printf("Warning: Only %d/%d points added to map! Possible filtering issue.\n", 
+                add_point_size, feats_down_size);
+        warning_counter = 0; // Reset counter after showing warning
+    }
+    else
+    {
+        // Only show "Added points" messages every 200 frames to reduce console spam
+        if (add_point_size > 0 && info_message_counter >= 200) {
+            printf("Added %d points to map from %d downsampled points\n", 
+                    add_point_size, feats_down_size);
+            info_message_counter = 0; // Reset counter after showing info
+        }
+    }
 }
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
@@ -512,7 +562,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
 
     /**************** save map ****************/
     /* 1. make sure you have enough memories
-    /* 2. noted that pcd save will influence the real-time performences **/
+    /* 2. noted that pcd save will largely influence the real-time performences **/
     /*
     if (pcd_save_en)
     {
@@ -578,36 +628,47 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
-void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
+void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_map)
 {
-    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
-    int size = laserCloudFullRes->points.size();
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(size, 1));
-
-    for (int i = 0; i < size; i++)
-    {
-        RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
-                            &laserCloudWorld->points[i]);
+    if (pub_map->get_subscription_count() == 0)
+        return;
+        
+    PointCloudXYZI::Ptr scan_publish_cloud(new PointCloudXYZI());
+    PointVector ikdtree_points;
+    ikdtree.flatten(ikdtree.Root_Node, ikdtree_points, NOT_RECORD);
+    
+    // Also get deleted points back to get a complete map
+    PointVector removed_points;
+    ikdtree.acquire_removed_points(removed_points);
+    
+    // Add current scan points and removed points to the map
+    scan_publish_cloud->points = ikdtree_points;
+    scan_publish_cloud->points.insert(scan_publish_cloud->points.end(), removed_points.begin(), removed_points.end());
+    
+    sensor_msgs::msg::PointCloud2 laserCloudMap;
+    pcl::toROSMsg(*scan_publish_cloud, laserCloudMap);
+    laserCloudMap.header.stamp = rclcpp::Clock().now();
+    laserCloudMap.header.frame_id = "map";
+    pub_map->publish(laserCloudMap);
+    
+    if (scan_publish_cloud->points.size() > 0) {
+        printf("Publishing map with %lu points\n", scan_publish_cloud->points.size());
     }
-    *pcl_wait_pub += *laserCloudWorld;
-
-    sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
-    pubLaserCloudMap->publish(laserCloudmsg);
-
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
-    // pubLaserCloudMap->publish(laserCloudMap);
 }
 
 void save_to_pcd()
 {
+    // This method is deprecated and maintained for backward compatibility
+    // It's better to use the LaserMappingNode::saveMapService or LaserMappingNode::saveMapCallback methods
+    RCLCPP_WARN(rclcpp::get_logger("rclcpp"), "save_to_pcd() is deprecated. Use service calls or periodic saving instead.");
+    
+    // Ensure PCD directory exists
+    std::string pcd_dir = string(ROOT_DIR) + "PCD/";
+    if (!std::filesystem::exists(pcd_dir)) {
+        std::filesystem::create_directories(pcd_dir);
+    }
+    
+    // Save to the configured path (typically test.pcd) for backward compatibility
     pcl::PCDWriter pcd_writer;
     pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
 }
@@ -656,6 +717,18 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
     trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
     tf_br->sendTransform(trans);
+
+    // Record path for map saving
+    PoseInfo current_pose;
+    current_pose.time = Measures.lidar_beg_time;
+    current_pose.x = state_point.pos(0);
+    current_pose.y = state_point.pos(1);
+    current_pose.z = state_point.pos(2);
+    current_pose.qw = state_point.rot.coeffs()[3];
+    current_pose.qx = state_point.rot.coeffs()[0];
+    current_pose.qy = state_point.rot.coeffs()[1];
+    current_pose.qz = state_point.rot.coeffs()[2];
+    path_record.push_back(current_pose);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -833,7 +906,20 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
-
+        this->declare_parameter("mapping.relocalization_mode", false);
+        this->declare_parameter("mapping.initial_pose", std::vector<double>{0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0});
+        this->declare_parameter("pcd_save.periodic_save", false);
+        this->declare_parameter("pcd_save.save_interval", 60.0);
+        this->declare_parameter("mapping.suppress_warnings", false);
+        this->declare_parameter("mapping.max_height", 3.0);
+        this->declare_parameter("mapping.ground_level", -0.5);
+        
+        // Add parameters for dynamic object filtering
+        this->declare_parameter("mapping.filter_dynamic_objects", true);
+        this->declare_parameter("mapping.dynamic_dist_threshold", 0.5);
+        this->declare_parameter("mapping.static_point_stability", 3);
+        this->declare_parameter("mapping.grid_cell_size", 0.2);
+        
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
@@ -869,16 +955,33 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
-
+        this->get_parameter_or<bool>("mapping.relocalization_mode", relocalization_mode, false);
+        this->get_parameter_or<vector<double>>("mapping.initial_pose", initial_pose, vector<double>{0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0});
+        this->get_parameter_or<bool>("pcd_save.periodic_save", periodic_save, false);
+        this->get_parameter_or<double>("pcd_save.save_interval", save_interval, 60.0);
+        this->get_parameter_or<bool>("mapping.suppress_warnings", suppress_point_warnings, false);
+        this->get_parameter_or<double>("mapping.max_height", max_height_, 3.0);
+        this->get_parameter_or<double>("mapping.ground_level", ground_level_, -0.5);
+        
+        // Get dynamic filtering parameters
+        this->get_parameter_or<bool>("mapping.filter_dynamic_objects", filter_dynamic_objects, true);
+        this->get_parameter_or<float>("mapping.dynamic_dist_threshold", dynamic_dist_threshold, 0.5);
+        this->get_parameter_or<int>("mapping.static_point_stability", static_point_stability, 3);
+        this->get_parameter_or<float>("mapping.grid_cell_size", grid_cell_size, 0.2);
+        
+        // For sequential scan TOF lidars, these warnings are expected, so suppress them by default
+        if (p_pre->lidar_type == AVIA) {
+            RCLCPP_INFO(this->get_logger(), "Sequential scan TOF lidar detected, suppressing point filter warnings by default");
+            suppress_point_warnings = true;
+        }
+        
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+        RCLCPP_INFO(this->get_logger(), "Map height filtering: min=%f, max=%f", ground_level_, max_height_);
+        RCLCPP_INFO(this->get_logger(), "Dynamic object filtering: enabled=%d, stability=%d, grid_size=%.2f", 
+                   filter_dynamic_objects, static_point_stability, grid_cell_size);
 
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id ="camera_init";
-
-        // /*** variables definition ***/
-        // int effect_feat_num = 0, frame_num = 0;
-        // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
-        // bool flg_EKF_converged, EKF_stop_flg = 0;
 
         FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
         HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
@@ -903,12 +1006,9 @@ public:
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
-        /*** debug record ***/
-        // FILE *fp;
         string pos_log_dir = root_dir + "/Log/pos_log.txt";
         fp = fopen(pos_log_dir.c_str(),"w");
 
-        // ofstream fout_pre, fout_out, fout_dbg;
         fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
         fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
         fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
@@ -917,7 +1017,6 @@ public:
         else
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
-        /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
         {
             sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
@@ -930,21 +1029,111 @@ public:
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
-        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        pubLaserScan_ = this->create_publisher<sensor_msgs::msg::LaserScan>("/scan", 20); // Changed to standard /scan topic
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
-        //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
 
-        auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
-        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
-
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
+        if (periodic_save && save_interval > 0) {
+            map_save_timer_ = this->create_wall_timer(
+                std::chrono::duration<double>(save_interval),
+                std::bind(&LaserMappingNode::saveMapCallback, this));
+            RCLCPP_INFO(this->get_logger(), "Periodic map saving enabled, interval: %.1f seconds", save_interval);
+        }
+
+        save_map_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "save_map", std::bind(&LaserMappingNode::saveMapService, this, std::placeholders::_1, std::placeholders::_2));
+        
+        load_map_service_ = this->create_service<fast_lio::srv::LoadMap>(
+            "load_map", std::bind(&LaserMappingNode::loadMapService, this, std::placeholders::_1, std::placeholders::_2));
+
+        pubGlobalMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/global_map", 1);
+        global_map_timer_ = this->create_wall_timer(
+            std::chrono::seconds(5), 
+            std::bind(&LaserMappingNode::publishGlobalMap, this));
+
+        // Initialize local map accumulation
+        accumulated_cloud_.reset(new PointCloudXYZI());
+        last_local_map_time_ = this->get_clock()->now();
+        timed_cloud_queue_.clear(); // Initialize the timed cloud queue
+        
+        // Create publisher for local map
+        pubLocalMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/local_map", 1);
+        
+        // Create timer for local map publishing (10Hz)
+        local_map_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(100), 
+            std::bind(&LaserMappingNode::publishLocalMap, this));
+        
+        // After node initialization and parameter loading, before RCLCPP_INFO about node init finished
+        // Add automatic map loading and relocalization
+        std::string pcd_dir = string(ROOT_DIR) + "PCD/";
+        std::string default_map_path = pcd_dir + "global_map.pcd";
+        if (std::filesystem::exists(default_map_path)) {
+            RCLCPP_INFO(this->get_logger(), "Found existing map at %s, attempting to load it", default_map_path.c_str());
+            bool load_success = loadMap(default_map_path);
+            if (load_success) {
+                RCLCPP_INFO(this->get_logger(), "Map loaded successfully, enabling relocalization mode");
+                // Enable relocalization automatically when map is loaded
+                relocalization_mode = true;
+                
+                // In relocalization mode, we don't set the initial pose here
+                // The system will automatically determine the position using accumulated scans
+                // when enough measurements have been received to perform place recognition
+                RCLCPP_INFO(this->get_logger(), "Automatic relocalization will be performed when enough measurements are received");
+            } else {
+                RCLCPP_WARN(this->get_logger(), "Failed to load map, continuing without relocalization");
+            }
+        }
+        
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
+
+        if (relocalization_mode) {
+            RCLCPP_INFO(this->get_logger(), "Starting in re-localization mode");
+            // The initial pose will be determined through scan context matching
+            // The first few scans will be used to generate a scan context descriptor
+            // which will be matched against the map to find the initial position
+        }
+
+        // Adjust downsampling parameters
+        filter_size_map_min = this->declare_parameter("mapping.filter_size_map", 0.1); // Reduce from 0.2 to 0.1
+        filter_size_surf_min = this->declare_parameter("mapping.filter_size_surf", 0.1); // Reduce if needed
+        
+        // Update voxel grid filter settings
+        downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
+        downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
+
+        // Loop closure parameters
+        this->declare_parameter<bool>("loop_closure.enabled", true);
+        this->declare_parameter<double>("loop_closure.search_radius", LOOP_CLOSURE_SEARCH_RADIUS);
+        this->declare_parameter<double>("loop_closure.min_distance", LOOP_CLOSURE_MIN_DIST);
+        this->declare_parameter<int>("loop_closure.detection_interval", LOOP_CLOSURE_DETECTION_INTERVAL);
+        this->declare_parameter<double>("loop_closure.fitness_score_threshold", LOOP_CLOSURE_FITNESS_SCORE_THRESH);
+        
+        loop_closure_enabled_ = this->get_parameter("loop_closure.enabled").as_bool();
+        loop_closure_search_radius_ = this->get_parameter("loop_closure.search_radius").as_double();
+        loop_closure_min_distance_ = this->get_parameter("loop_closure.min_distance").as_double();
+        loop_closure_detection_interval_ = this->get_parameter("loop_closure.detection_interval").as_int();
+        loop_closure_fitness_score_threshold_ = this->get_parameter("loop_closure.fitness_score_threshold").as_double();
+        
+        // Publisher for loop closure markers
+        pubLoopClosureMarker_ = this->create_publisher<visualization_msgs::msg::Marker>("loop_closure_marker", 10);
+        
+        RCLCPP_INFO(this->get_logger(), "Loop closure detection %s", loop_closure_enabled_ ? "enabled" : "disabled");
+        if (loop_closure_enabled_) {
+            RCLCPP_INFO(this->get_logger(), "Loop closure parameters:");
+            RCLCPP_INFO(this->get_logger(), "  Search radius: %.2f m", loop_closure_search_radius_);
+            RCLCPP_INFO(this->get_logger(), "  Min distance: %.2f m", loop_closure_min_distance_);
+            RCLCPP_INFO(this->get_logger(), "  Detection interval: %d frames", loop_closure_detection_interval_);
+            RCLCPP_INFO(this->get_logger(), "  Fitness score threshold: %.2f", loop_closure_fitness_score_threshold_);
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Map height filtering: min=%f, max=%f", ground_level_, max_height_);
     }
 
     ~LaserMappingNode()
@@ -954,9 +1143,166 @@ public:
         fclose(fp);
     }
 
-private:
+    bool loadMap(const std::string& map_path)
+    {
+        pcl::PointCloud<PointType>::Ptr loaded_map(new pcl::PointCloud<PointType>());
+        
+        if (pcl::io::loadPCDFile<PointType>(map_path, *loaded_map) == -1) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to load map from %s", map_path.c_str());
+            return false;
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "Loaded map with %lu points from %s", 
+                    loaded_map->size(), map_path.c_str());
+        
+        // Clear current map using DeleteTree() method
+        ikdtree.InitializeKDTree(); // Reset the tree with default parameters
+        
+        // Insert loaded points into ikd-tree
+        ikdtree.Build(loaded_map->points);
+        
+        // For scan context-based relocalization, create a keyframe from the loaded map
+        // We'll use this as a reference for place recognition
+        if (!keyframes_.empty()) {
+            keyframes_.clear(); // Clear any existing keyframes
+        }
+        
+        // Downsample the map for efficient scan context generation
+        pcl::PointCloud<PointType>::Ptr downsampled_map(new pcl::PointCloud<PointType>());
+        pcl::VoxelGrid<PointType> voxel_grid;
+        voxel_grid.setLeafSize(0.5, 0.5, 0.5); // Larger leaf size for scan context
+        voxel_grid.setInputCloud(loaded_map);
+        voxel_grid.filter(*downsampled_map);
+        
+        // Create a keyframe for the map at origin
+        // The actual pose doesn't matter as much as the scan context descriptor
+        Eigen::Matrix4d map_pose = Eigen::Matrix4d::Identity();
+        
+        std::shared_ptr<KeyFrame> map_keyframe = std::make_shared<KeyFrame>(
+            0, // ID
+            0.0, // timestamp (not important for map)
+            map_pose,
+            downsampled_map
+        );
+        
+        // Generate scan context for this keyframe
+        map_keyframe->scan_context = generateScanContext(downsampled_map);
+        
+        // Add to keyframes list
+        keyframes_.push_back(map_keyframe);
+        
+        RCLCPP_INFO(this->get_logger(), "Created keyframe from map with %lu points for scan context matching",
+                   downsampled_map->size());
+        
+        return true;
+    }
+
+    bool loadMapService(const std::shared_ptr<fast_lio::srv::LoadMap::Request> request,
+                       std::shared_ptr<fast_lio::srv::LoadMap::Response> response)
+    {
+        bool success = loadMap(request->map_path);
+        response->success = success;
+        if (success) {
+            response->message = "Map loaded successfully";
+        } else {
+            response->message = "Failed to load map";
+        }
+        return true;
+    }
+
     void timer_callback()
     {
+        // Remove static declarations since we now use class members
+        if (relocalization_mode && !relocalization_done_)
+        {
+            if (!sync_packages(Measures)) {
+                return;
+            }
+
+            p_imu->Process(Measures, kf, feats_undistort);
+            feats_down_body->clear();
+            feats_down_world->clear();
+            
+            // Filter points and transform them to world frame
+            for (int i = 0; i < feats_undistort->points.size(); i++)
+            {
+                if (i % p_pre->point_filter_num == 0)
+                {
+                    PointType p_body(feats_undistort->points[i]);
+                    feats_down_body->points.push_back(p_body);
+                    
+                    PointType p_world;
+                    pointBodyToWorld(&p_body, &p_world);
+                    feats_down_world->points.push_back(p_world);
+                }
+            }
+            
+            // Update size for further processing
+            feats_down_size = feats_down_world->points.size();
+            
+            // Add these points to our accumulated local map
+            accumulateLocalMap(feats_down_world);
+            
+            // Try relocalization if we have accumulated enough points
+            if (accumulated_cloud_->points.size() > 3000) {
+                if (attemptRelocalization()) {
+                    relocalization_done_ = true;
+                    relocalization_reset_needed_ = true;
+                    
+                    // Clear the accumulated cloud now that relocalization succeeded
+                    accumulated_cloud_->clear();
+                    timed_cloud_queue_.clear(); // Also clear the timed cloud queue
+                    RCLCPP_INFO(this->get_logger(), "Relocalization completed successfully. System state and map have been reset to the new position.");
+                    
+                    // Force a reset of the lidar_buffer and imu_buffer to avoid using outdated measurements
+                    mtx_buffer.lock();
+                    lidar_buffer.clear();
+                    imu_buffer.clear();
+                    mtx_buffer.unlock();
+                    
+                    // Return early to ensure the next scan starts fresh with the new position
+                    return;
+                } else {
+                    RCLCPP_INFO(this->get_logger(), "Attempting relocalization (accumulated %zu points, need more data...)", 
+                               accumulated_cloud_->points.size());
+                }
+            } else {
+                RCLCPP_INFO(this->get_logger(), "Accumulating points for relocalization: %zu/%d", 
+                           accumulated_cloud_->points.size(), 3000);
+            }
+            
+            // Skip the rest of processing until relocalized
+            if (!relocalization_done_) return;
+        }
+
+        // Handle first scan after relocalization
+        if (relocalization_done_ && relocalization_reset_needed_) {
+            if (!sync_packages(Measures)) {
+                return;
+            }
+            
+            // Reset this flag to indicate we've handled the relocalization reset
+            relocalization_reset_needed_ = false;
+            
+            // Need to reinitialize first_lidar_time to avoid discontinuities
+            first_lidar_time = Measures.lidar_beg_time;
+            p_imu->first_lidar_time = first_lidar_time;
+            
+            // Set flag to force re-initialization properly using public properties 
+            // instead of accessing private members
+            p_imu->Reset(); // Use the public Reset() method to fully reset IMU state
+            
+            // Start scan processing from beginning
+            flg_first_scan = true;
+            flg_EKF_inited = false;
+            
+            RCLCPP_INFO(this->get_logger(), "Processing first scan after successful relocalization with full IMU reset");
+            return; // Skip the rest of the processing to force a complete restart cycle
+        }
+
+        /*** Segment the map in lidar FOV ***/
+        lasermap_fov_segment();
+
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
@@ -972,25 +1318,15 @@ private:
             match_time = 0;
             kdtree_search_time = 0.0;
             solve_time = 0;
-            solve_const_H_time = 0;
-            svd_time   = 0;
-            t0 = omp_get_wtime();
-
+            
             p_imu->Process(Measures, kf, feats_undistort);
-            state_point = kf.get_x();
-            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
-
-            if (feats_undistort->empty() || (feats_undistort == NULL))
-            {
-                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+            
+            if (feats_undistort->empty() || (feats_undistort == NULL)) {
                 return;
             }
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
-            /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
-
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
             downSizeFilterSurf.filter(*feats_down_body);
@@ -1015,8 +1351,6 @@ private:
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
             
-            // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
-
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
             {
@@ -1065,7 +1399,20 @@ private:
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
+            
+            // Initialize all points as selected before filtering
+            memset(point_selected_surf, true, sizeof(bool) * feats_down_size);
+            
+            // Filter dynamic objects from the point cloud before adding to map
+            if (filter_dynamic_objects) {
+                filterDynamicPoints();
+            }
+            
             map_incremental();
+            
+            // Add the current scan to the local map for continuous visualization
+            accumulateLocalMap(feats_down_world);
+            
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
@@ -1074,6 +1421,9 @@ private:
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
+            
+            // Publish laser scan for costmap usage
+            if (scan_pub_en) publish_laser_scan(feats_down_body);
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1104,44 +1454,896 @@ private:
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
                 dump_lio_state_to_log(fp);
             }
+
+            // After processing the current frame and updating the map
+            if (loop_closure_enabled_ && flg_EKF_inited) {
+                // Add keyframe at regular intervals
+                static int frame_count = 0;
+                frame_count++;
+                
+                if (frame_count % loop_closure_detection_interval_ == 0) {
+                    addKeyFrame();
+                    detectLoopClosure();
+                }
+            }
         }
     }
 
-    void map_publish_callback()
+    void map_save_callback(const std::shared_ptr<std_srvs::srv::Trigger::Request> req, std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
-        if (map_pub_en) publish_map(pubLaserCloudMap_);
+        // Delegate to the service method that handles on-demand saving to global_map.pcd
+        saveMapService(req, res);
     }
 
-    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+    void saveMapCallback()
     {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
-        if (pcd_save_en)
-        {
-            save_to_pcd();
-            res->success = true;
-            res->message = "Map saved.";
+        if (!pcd_save_en) return;
+        
+        RCLCPP_INFO(this->get_logger(), "Saving periodic map snapshot...");
+        
+        // Ensure PCD directory exists
+        std::string pcd_dir = string(ROOT_DIR) + "PCD/";
+        if (!std::filesystem::exists(pcd_dir)) {
+            RCLCPP_INFO(this->get_logger(), "Creating PCD directory: %s", pcd_dir.c_str());
+            std::filesystem::create_directories(pcd_dir);
         }
-        else
-        {
-            res->success = false;
-            res->message = "Map save disabled.";
+        
+        // Generate timestamped filename for periodic saves
+        auto now = std::chrono::system_clock::now();
+        auto in_time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d_%H-%M-%S");
+        std::string timestamp_str = ss.str();
+        
+        // Get all points from ikdtree
+        PointVector ikdtree_points;
+        ikdtree.flatten(ikdtree.Root_Node, ikdtree_points, NOT_RECORD);
+        
+        // Convert to PointCloudXYZI
+        PointCloudXYZI::Ptr global_map(new PointCloudXYZI());
+        global_map->points.resize(ikdtree_points.size());
+        for (size_t i = 0; i < ikdtree_points.size(); i++) {
+            global_map->points[i] = ikdtree_points[i];
         }
+        
+        // Filter points by height
+        PointCloudXYZI::Ptr filtered_map = filterPointsByHeight(global_map);
+        
+        // Use timestamped filename format for periodic saves
+        std::string periodic_map_path(pcd_dir + "tmp/Global_Map_" + timestamp_str + ".pcd");
+        pcl::PCDWriter pcd_writer;
+        pcd_writer.writeBinary(periodic_map_path, *filtered_map);
+        
+        // Save trajectory
+        std::string trajectory_path = pcd_dir + "tmp/trajectory_" + timestamp_str + ".txt";
+        std::ofstream trajectory_file(trajectory_path);
+        
+        if (trajectory_file.is_open()) {
+            for (const auto& pose : path_record) {
+                trajectory_file << std::fixed << std::setprecision(6)
+                              << pose.time << " "
+                              << pose.x << " " << pose.y << " " << pose.z << " "
+                              << pose.qw << " " << pose.qx << " " << pose.qy << " " << pose.qz << std::endl;
+            }
+            trajectory_file.close();
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "Saved periodic map with %zu points (filtered from %zu points) to %s",
+                    filtered_map->points.size(), global_map->points.size(), periodic_map_path.c_str());
+    }
+
+    bool saveMapService(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                       std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        RCLCPP_INFO(this->get_logger(), "Saving map to PCD file...");
+        
+        // Ensure PCD directory exists
+        std::string pcd_dir = string(ROOT_DIR) + "PCD/";
+        if (!std::filesystem::exists(pcd_dir)) {
+            RCLCPP_INFO(this->get_logger(), "Creating PCD directory: %s", pcd_dir.c_str());
+            std::filesystem::create_directories(pcd_dir);
+        }
+        
+        // Generate timestamped filename
+        auto now = std::chrono::system_clock::now();
+        auto in_time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d_%H-%M-%S");
+        std::string timestamp_str = ss.str();
+        
+        // Get all points from ikdtree
+        PointVector ikdtree_points;
+        ikdtree.flatten(ikdtree.Root_Node, ikdtree_points, NOT_RECORD);
+        
+        // Convert to PointCloudXYZI
+        PointCloudXYZI::Ptr global_map(new PointCloudXYZI());
+        global_map->points.resize(ikdtree_points.size());
+        for (size_t i = 0; i < ikdtree_points.size(); i++) {
+            global_map->points[i] = ikdtree_points[i];
+        }
+        
+        // Filter points by height
+        PointCloudXYZI::Ptr filtered_map = filterPointsByHeight(global_map);
+        
+        // Save trajectory
+        std::string trajectory_path = pcd_dir + "tmp/trajectory_" + timestamp_str + ".txt";
+        std::ofstream trajectory_file(trajectory_path);
+        
+        if (trajectory_file.is_open()) {
+            for (const auto& pose : path_record) {
+                trajectory_file << std::fixed << std::setprecision(6)
+                               << pose.time << " "
+                               << pose.x << " " << pose.y << " " << pose.z << " "
+                               << pose.qw << " " << pose.qx << " " << pose.qy << " " << pose.qz << std::endl;
+            }
+            trajectory_file.close();
+            RCLCPP_INFO(this->get_logger(), "Saved trajectory to %s", trajectory_path.c_str());
+        } else {
+            RCLCPP_WARN(this->get_logger(), "Failed to open trajectory file for writing: %s", trajectory_path.c_str());
+        }
+        
+        // Save the map
+        std::string pcd_path = pcd_dir + "tmp/Global_Map_" + timestamp_str + ".pcd";
+        pcl::PCDWriter pcd_writer;
+        pcd_writer.writeBinary(pcd_path, *filtered_map);
+        
+        response->success = true;
+        response->message = "Successfully saved map with " + std::to_string(filtered_map->points.size()) + 
+                          " points (filtered from " + std::to_string(global_map->points.size()) + " points) to " + pcd_path;
+        
+        RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
+        return true;
+    }
+
+    void publishGlobalMap() {
+        if (pubGlobalMap_->get_subscription_count() == 0) {
+            return;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Publishing global map...");
+
+        // Get all points from ikdtree
+        PointVector ikdtree_points;
+        ikdtree.flatten(ikdtree.Root_Node, ikdtree_points, NOT_RECORD);
+        
+        // Convert to PointCloudXYZI
+        PointCloudXYZI::Ptr global_map(new PointCloudXYZI());
+        global_map->points.resize(ikdtree_points.size());
+        for (size_t i = 0; i < ikdtree_points.size(); i++) {
+            global_map->points[i] = ikdtree_points[i];
+        }
+        
+        // Filter points by height for the output map
+        PointCloudXYZI::Ptr filtered_map = filterPointsByHeight(global_map);
+        
+        // Convert to ROS message and publish
+        sensor_msgs::msg::PointCloud2 global_map_msg;
+        pcl::toROSMsg(*filtered_map, global_map_msg);
+        global_map_msg.header.stamp = this->get_clock()->now();
+        global_map_msg.header.frame_id = "map";
+        pubGlobalMap_->publish(global_map_msg);
+        
+        RCLCPP_INFO(this->get_logger(), "Global map published with %zu points (filtered from %zu points)",
+                   filtered_map->points.size(), global_map->points.size());
+    }
+
+    // Add current frame as a keyframe
+    void addKeyFrame() {
+        // Create a copy of the current point cloud
+        pcl::PointCloud<PointType>::Ptr cloud_copy(new pcl::PointCloud<PointType>());
+        *cloud_copy = *feats_down_body;
+        
+        // Create transformation matrix from current state
+        Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+        Eigen::Matrix3d rot = state_point.rot.toRotationMatrix();
+        
+        // Fill rotation part
+        pose.block<3, 3>(0, 0) = rot;
+        
+        // Fill translation part
+        pose.block<3, 1>(0, 3) = Eigen::Vector3d(state_point.pos(0), state_point.pos(1), state_point.pos(2));
+        
+        // Create keyframe
+        std::shared_ptr<KeyFrame> keyframe = std::make_shared<KeyFrame>(
+            keyframes_.size(),
+            Measures.lidar_beg_time,
+            pose,
+            cloud_copy
+        );
+        
+        // Generate scan context for this keyframe
+        keyframe->scan_context = generateScanContext(cloud_copy);
+        
+        // Add to keyframes list
+        keyframes_.push_back(keyframe);
+        
+        RCLCPP_INFO(this->get_logger(), "Added keyframe %d at position [%.2f, %.2f, %.2f]", 
+                    static_cast<int>(keyframes_.size() - 1),
+                    state_point.pos(0), state_point.pos(1), state_point.pos(2));
+    }
+    
+    // Detect loop closure
+    void detectLoopClosure() {
+        if (keyframes_.size() < 2) {
+            return; // Not enough keyframes yet
+        }
+        
+        // Get the latest keyframe
+        std::shared_ptr<KeyFrame> current_keyframe = keyframes_.back();
+        
+        // Get current position
+        Eigen::Vector3d current_position = current_keyframe->pose.block<3, 1>(0, 3);
+        
+        // Exclude the most recent keyframes (exclude last loop_closure_detection_interval)
+        int exclude_recent_num = 1;
+        
+        // Find the best matching scan context
+        auto [match_idx, match_score] = findBestMatchingScanContext(
+            current_keyframe->scan_context,
+            keyframes_,
+            exclude_recent_num
+        );
+        
+        // If no match found
+        if (match_idx < 0) {
+            return;
+        }
+        
+        // Get the matched keyframe
+        std::shared_ptr<KeyFrame> matched_keyframe = keyframes_[match_idx];
+        
+        // Get matched position
+        Eigen::Vector3d matched_position = matched_keyframe->pose.block<3, 1>(0, 3);
+        
+        // Check if the keyframes are far enough apart
+        double distance = (current_position - matched_position).norm();
+        if (distance < loop_closure_min_distance_) {
+            return; // Too close, not a true loop closure
+        }
+        
+        // Perform ICP to refine the transformation
+        double fitness_score = 0.0;
+        Eigen::Matrix4d relative_transform = performICPMatching(
+            current_keyframe->cloud,
+            matched_keyframe->cloud,
+            Eigen::Matrix4d::Identity(), // Initial guess (can be improved)
+            &fitness_score
+        );
+        
+        // Check ICP fitness score
+        if (fitness_score > loop_closure_fitness_score_threshold_) {
+            RCLCPP_INFO(this->get_logger(), "Loop closure ICP failed: fitness score too high (%.4f > %.4f)",
+                       fitness_score, loop_closure_fitness_score_threshold_);
+            return;
+        }
+        
+        // Compute the error/drift
+        Eigen::Matrix4d expected_pose = matched_keyframe->pose;
+        Eigen::Matrix4d actual_pose = current_keyframe->pose;
+        Eigen::Matrix4d error = expected_pose.inverse() * actual_pose * relative_transform.inverse();
+        
+        // Apply correction (simplified - in a full implementation, we would update the pose graph)
+        RCLCPP_INFO(this->get_logger(), "Loop closure detected between frames %d and %d (current), distance: %.2f m, score: %.4f",
+                    match_idx, static_cast<int>(keyframes_.size() - 1), distance, match_score);
+        
+        // Publish marker for visualization
+        publishLoopClosureMarker(matched_position, current_position);
+        
+        // In a real implementation, you would:
+        // 1. Update the pose graph
+        // 2. Perform pose graph optimization
+        // 3. Update all poses
+        // 4. Rebuild the map
+        
+        // For demonstration, we'll just print the correction
+        Eigen::Vector3d translation_error = error.block<3, 1>(0, 3);
+        RCLCPP_INFO(this->get_logger(), "Detected drift: [%.2f, %.2f, %.2f] m",
+                    translation_error.x(), translation_error.y(), translation_error.z());
+    }
+    
+    // Publish a marker to visualize the loop closure
+    void publishLoopClosureMarker(const Eigen::Vector3d& position1, const Eigen::Vector3d& position2) {
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = "map";
+        marker.header.stamp = this->now();
+        marker.ns = "loop_closure";
+        marker.id = 0;
+        marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        marker.pose.orientation.w = 1.0;
+        marker.scale.x = 0.2; // Line width
+        marker.color.r = 1.0;
+        marker.color.g = 0.0;
+        marker.color.b = 0.0;
+        marker.color.a = 1.0;
+        
+        geometry_msgs::msg::Point p1, p2;
+        p1.x = position1.x();
+        p1.y = position1.y();
+        p1.z = position1.z();
+        
+        p2.x = position2.x();
+        p2.y = position2.y();
+        p2.z = position2.z();
+        
+        marker.points.push_back(p1);
+        marker.points.push_back(p2);
+        
+        pubLoopClosureMarker_->publish(marker);
+    }
+
+    bool attemptRelocalization() 
+    {
+        // Check if we have loaded a map keyframe
+        if (keyframes_.size() < 1) {
+            RCLCPP_INFO(this->get_logger(), "Cannot attempt relocalization, no keyframes loaded (%zu keyframes, %zu points)", 
+                       keyframes_.size(), accumulated_cloud_->points.size());
+            return false;
+        }
+        
+        // Ensure we have enough points in the accumulated cloud for a robust match
+        // Increased from 1000 to 3000 points for better relocalization in new positions
+        if (accumulated_cloud_->points.size() < 3000) {
+            RCLCPP_INFO(this->get_logger(), "Not enough points for relocalization (%zu points, need at least 3000)", 
+                       accumulated_cloud_->points.size());
+            return false;
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "Attempting relocalization with accumulated cloud of %zu points", 
+                   accumulated_cloud_->points.size());
+        
+        // Get the first keyframe (the map)
+        std::shared_ptr<KeyFrame> map_keyframe = keyframes_[0];
+        
+        // Use the accumulated cloud
+        PointCloudXYZI::Ptr source_cloud(new PointCloudXYZI(*accumulated_cloud_));
+        PointCloudXYZI::Ptr target_cloud(new PointCloudXYZI(*map_keyframe->cloud));
+        
+        // Filter clouds for faster ICP - use a safe leaf size to avoid integer overflow
+        PointCloudXYZI::Ptr source_filtered(new PointCloudXYZI());
+        PointCloudXYZI::Ptr target_filtered(new PointCloudXYZI());
+        
+        // Temporarily set a larger leaf size to avoid the integer overflow issue
+        double original_leaf_size = filter_size_map_min;
+        double safe_leaf_size = std::max(0.2, original_leaf_size); // Use at least 0.2m leaf size
+        
+        pcl::VoxelGrid<PointType> temp_filter;
+        temp_filter.setLeafSize(safe_leaf_size, safe_leaf_size, safe_leaf_size);
+        
+        // Filter source and target using the safer parameters
+        temp_filter.setInputCloud(source_cloud);
+        temp_filter.filter(*source_filtered);
+        
+        temp_filter.setInputCloud(target_cloud);
+        temp_filter.filter(*target_filtered);
+        
+        RCLCPP_INFO(this->get_logger(), "Filtered source cloud: %zu points, target cloud: %zu points",
+                  source_filtered->points.size(), target_filtered->points.size());
+        
+        // Define a list of initial transformations to try
+        // This helps ICP find the correct alignment even with large displacements
+        std::vector<Eigen::Matrix4f> initial_transformations;
+        
+        // Add identity matrix (no transformation - default)
+        Eigen::Matrix4f identity = Eigen::Matrix4f::Identity();
+        initial_transformations.push_back(identity);
+        
+        // Add translation of 5m along X (forward)
+        Eigen::Matrix4f trans_5m_x = Eigen::Matrix4f::Identity();
+        trans_5m_x(0, 3) = 5.0;  // 5m in x direction
+        initial_transformations.push_back(trans_5m_x);
+        
+        // Add translation of 5m along Y (right)
+        Eigen::Matrix4f trans_5m_y = Eigen::Matrix4f::Identity();
+        trans_5m_y(1, 3) = 5.0;  // 5m in y direction
+        initial_transformations.push_back(trans_5m_y);
+        
+        // Add translation of -5m along Y (left)
+        Eigen::Matrix4f trans_neg_5m_y = Eigen::Matrix4f::Identity();
+        trans_neg_5m_y(1, 3) = -5.0;  // -5m in y direction
+        initial_transformations.push_back(trans_neg_5m_y);
+        
+        // Also try 10m in x direction (based on the screenshot showing ~10m displacement)
+        Eigen::Matrix4f trans_10m_x = Eigen::Matrix4f::Identity();
+        trans_10m_x(0, 3) = 10.0;
+        initial_transformations.push_back(trans_10m_x);
+        
+        // Store best result
+        bool converged = false;
+        float best_fitness_score = std::numeric_limits<float>::max();
+        Eigen::Matrix4f best_transformation = Eigen::Matrix4f::Identity();
+        
+        // Try each initial transformation
+        for (size_t i = 0; i < initial_transformations.size(); i++) {
+            // Perform ICP to find the transformation
+            pcl::IterativeClosestPoint<PointType, PointType> icp;
+            // Increase max correspondence distance to handle larger displacements
+            icp.setMaxCorrespondenceDistance(10.0);
+            // Increase max iterations for more thorough alignment
+            icp.setMaximumIterations(200);
+            icp.setTransformationEpsilon(1e-6);
+            icp.setEuclideanFitnessEpsilon(1e-6);
+            
+            // Set initial transformation
+            icp.setInputSource(source_filtered);
+            icp.setInputTarget(target_filtered);
+            
+            // Set initial alignment
+            Eigen::Matrix4f init_guess = initial_transformations[i];
+            
+            RCLCPP_INFO(this->get_logger(), "Trying initial transformation #%zu", i);
+            
+            PointCloudXYZI::Ptr aligned(new PointCloudXYZI());
+            icp.align(*aligned, init_guess);
+            
+            float fitness_score = icp.getFitnessScore();
+            RCLCPP_INFO(this->get_logger(), "Initial guess %zu: Converged=%d, Fitness score=%f", 
+                       i, icp.hasConverged(), fitness_score);
+            
+            // Update best result if this one is better
+            if (icp.hasConverged() && fitness_score < best_fitness_score) {
+                converged = true;
+                best_fitness_score = fitness_score;
+                best_transformation = icp.getFinalTransformation();
+            }
+        }
+        
+        // Check if any of the attempts converged with a good fitness score
+        if (converged && best_fitness_score < 5.0) {
+            // Extract transformation parameters
+            Eigen::Matrix3f rotation_matrix = best_transformation.block<3,3>(0,0);
+            Eigen::Vector3f translation = best_transformation.block<3,1>(0,3);
+            
+            // Convert to quaternion
+            Eigen::Quaternionf q(rotation_matrix);
+            
+            RCLCPP_INFO(this->get_logger(), "Relocalization successful! Position: [%f, %f, %f], Orientation (quat): [%f, %f, %f, %f], Fitness score: %f", 
+                       translation(0), translation(1), translation(2),
+                       q.w(), q.x(), q.y(), q.z(),
+                       best_fitness_score);
+            
+            // Update the state with the found position
+            state_point.pos = V3D(translation(0), translation(1), translation(2));
+            state_point.rot = Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z());
+            
+            // Reset the velocity and bias states - these should be re-estimated from the new position
+            state_point.vel.setZero();
+            state_point.bg.setZero();
+            state_point.ba.setZero();
+            
+            // Update derived state variables used for odometry and mapping
+            pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+            geoQuat.x = state_point.rot.coeffs()[0];
+            geoQuat.y = state_point.rot.coeffs()[1];
+            geoQuat.z = state_point.rot.coeffs()[2];
+            geoQuat.w = state_point.rot.coeffs()[3];
+            
+            // Reset KF filter state to match the new position
+            kf.change_x(state_point);
+            
+            // Reset EKF covariance to initial values
+            esekfom::esekf<state_ikfom, 12, input_ikfom>::cov P = kf.get_P();
+            P.setIdentity();
+            P(6,6) = P(7,7) = P(8,8) = 0.00001;
+            P(9,9) = P(10,10) = P(11,11) = 0.00001;
+            P(15,15) = P(16,16) = P(17,17) = 0.0001;
+            P(18,18) = P(19,19) = P(20,20) = 0.001;
+            P(21,21) = P(22,22) = 0.00001;
+            kf.change_P(P);
+            
+            // Clear the path to start from the relocated position
+            path.poses.clear();
+            
+            // Clear the map and create a new tree with the keyframe data
+            ikdtree.InitializeKDTree();
+            
+            // Use the first keyframe cloud as the initial map
+            PointCloudXYZI::Ptr initial_map(new PointCloudXYZI(*map_keyframe->cloud));
+            ikdtree.Build(initial_map->points);
+            
+            // Completely reset the IMU processor to avoid velocity discontinuities
+            p_imu->Reset();
+            
+            // Remove these lines that reference the local variables that no longer exist
+            // relocalization_done = true;
+            // relocalization_reset_needed = true;
+            
+            // Reset internal variables to ensure clean restart
+            flg_EKF_inited = false;
+            
+            // Immediately publish the updated odometry to reflect the new position
+            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            
+            return true;
+        } else {
+            RCLCPP_WARN(this->get_logger(), "All ICP attempts failed to find a good match. Best fitness score: %f", 
+                       best_fitness_score);
+            return false;
+        }
+    }
+
+    void publishLocalMap() {
+        std::lock_guard<std::mutex> lock(local_map_mutex_);
+        
+        if (timed_cloud_queue_.empty()) {
+            RCLCPP_DEBUG(this->get_logger(), "No points to publish in local map");
+            return;
+        }
+        
+        // Create a fresh point cloud for the local map
+        PointCloudXYZI::Ptr local_map(new PointCloudXYZI());
+        
+        // Add points from timed_cloud_queue_ with enhanced intensity based on recency
+        for (size_t i = 0; i < timed_cloud_queue_.size(); i++) {
+            // Calculate how recent this cloud is (0.0 = oldest, 1.0 = newest)
+            double recency = static_cast<double>(i) / static_cast<double>(timed_cloud_queue_.size());
+            
+            // Get the points from this cloud
+            const PointCloudXYZI::Ptr& cloud = timed_cloud_queue_[i].second;
+            
+            // Add these points to the local map with enhanced intensity based on recency
+            for (const auto& point : cloud->points) {
+                PointType new_point = point;
+                
+                // Scale intensity by recency (newer points are brighter)
+                // Adjust these values to control the visual effect
+                double time_factor = recency * 0.5 + 0.5; // ranges from 0.5 to 1.0
+                new_point.intensity *= time_factor;
+                
+                local_map->points.push_back(new_point);
+            }
+        }
+        
+        // Ensure the width/height are set correctly for the point cloud
+        local_map->width = local_map->points.size();
+        local_map->height = 1;
+        
+        // Skip publishing if we have no points
+        if (local_map->points.empty()) {
+            RCLCPP_DEBUG(this->get_logger(), "No points to publish in local map after processing");
+            return;
+        }
+        
+        // Downsample the local map with a custom filter to avoid leaf size warnings
+        PointCloudXYZI::Ptr local_map_ds(new PointCloudXYZI());
+        
+        // Use a larger leaf size for downsampling to prevent integer overflow
+        pcl::VoxelGrid<PointType> local_filter;
+        float ds_leaf_size = 0.2; // Larger leaf size to prevent overflow warnings
+        local_filter.setLeafSize(ds_leaf_size, ds_leaf_size, ds_leaf_size);
+        local_filter.setInputCloud(local_map);
+        local_filter.filter(*local_map_ds);
+        
+        // Publish the local map
+        sensor_msgs::msg::PointCloud2 local_map_msg;
+        pcl::toROSMsg(*local_map_ds, local_map_msg);
+        local_map_msg.header.stamp = this->get_clock()->now();
+        local_map_msg.header.frame_id = "camera_init";
+        pubLocalMap_->publish(local_map_msg);
+        
+        RCLCPP_DEBUG(this->get_logger(), "Published local map with %lu points from %lu clouds", 
+                   local_map_ds->points.size(), timed_cloud_queue_.size());
+    }
+    
+    // Add a method to accumulate points for the local map
+    void accumulateLocalMap(const PointCloudXYZI::Ptr& transformed_cloud) {
+        std::lock_guard<std::mutex> lock(local_map_mutex_);
+        
+        // Get current time
+        rclcpp::Time current_time = this->get_clock()->now();
+        
+        // Make a copy of the transformed cloud
+        PointCloudXYZI::Ptr cloud_copy(new PointCloudXYZI(*transformed_cloud));
+        
+        // Add to our queue with timestamp for visualization
+        timed_cloud_queue_.push_back(std::make_pair(current_time, cloud_copy));
+        
+        // Only accumulate points for relocalization if we're in relocalization mode and relocalization is not done yet
+        if (relocalization_mode && !relocalization_done_) {
+            // Add transformed points to accumulated cloud for relocalization
+            *accumulated_cloud_ += *transformed_cloud;
+            
+            // Log the accumulated point count for relocalization
+            RCLCPP_INFO(this->get_logger(), "Accumulating points for relocalization: %zu/%d", 
+                      accumulated_cloud_->points.size(), 3000);
+                      
+            // Cap the number of points for relocalization to prevent excessive memory usage
+            if (accumulated_cloud_->points.size() > 100000) {
+                // Downsample the cloud with a larger leaf size to prevent integer overflow
+                PointCloudXYZI::Ptr temp(new PointCloudXYZI());
+                pcl::VoxelGrid<PointType> temp_filter;
+                float larger_leaf_size = 0.3; // Use a larger leaf size for downsample
+                temp_filter.setLeafSize(larger_leaf_size, larger_leaf_size, larger_leaf_size);
+                temp_filter.setInputCloud(accumulated_cloud_);
+                temp_filter.filter(*temp);
+                accumulated_cloud_ = temp;
+                
+                RCLCPP_INFO(this->get_logger(), "Downsampled accumulated cloud to %zu points with leaf size %.2f", 
+                          accumulated_cloud_->points.size(), larger_leaf_size);
+            }
+        }
+        
+        // Update last map time
+        last_local_map_time_ = current_time;
+        
+        // In normal operation, use a shorter time window to show more dynamic changes
+        // In relocalization mode, use a longer window for better matching
+        double time_window = relocalization_mode ? 30.0 : 2.0; // seconds
+        
+        // Remove older clouds from the queue
+        int removed_clouds = 0;
+        while (!timed_cloud_queue_.empty()) {
+            auto& oldest = timed_cloud_queue_.front();
+            double age = (current_time - oldest.first).seconds();
+            
+            if (age > time_window) {
+                timed_cloud_queue_.pop_front(); // Remove the oldest cloud
+                removed_clouds++;
+            } else {
+                break; // Stop once we find a cloud that's within our time window
+            }
+        }
+        
+        // Log clouds kept and removed
+        if (removed_clouds > 0) {
+            RCLCPP_DEBUG(this->get_logger(), "Local map: Kept %lu recent clouds (%.1f sec window), removed %d old clouds", 
+                      timed_cloud_queue_.size(), time_window, removed_clouds);
+        }
+    }
+
+    // Publish a laser scan for costmap usage
+    void publish_laser_scan(const pcl::PointCloud<PointType>::Ptr& cloud) {
+        if (!cloud || cloud->empty()) {
+            RCLCPP_WARN(this->get_logger(), "Empty point cloud, not publishing laser scan");
+            return;
+        }
+
+        // Create a laser scan message
+        sensor_msgs::msg::LaserScan laser_scan;
+        laser_scan.header.stamp = this->now();
+        laser_scan.header.frame_id = "camera_init"; // Match the frame used by FAST-LIO
+
+        // Set the parameters for the laser scan
+        const double angle_min = -M_PI;        // -180 degrees
+        const double angle_max = M_PI;         // 180 degrees
+        const int num_rays = 720;              // Number of rays in the scan (2 rays per degree)
+        const double angle_increment = (angle_max - angle_min) / num_rays;
+
+        // Configure laser scan
+        laser_scan.angle_min = angle_min;
+        laser_scan.angle_max = angle_max;
+        laser_scan.angle_increment = angle_increment;
+        laser_scan.time_increment = 0.0;
+        laser_scan.scan_time = 0.1;            // 10Hz scan rate
+        laser_scan.range_min = 0.3;            // Minimum range (matches blind parameter)
+        laser_scan.range_max = 100.0;          // Maximum range
+
+        // Initialize ranges to max range
+        laser_scan.ranges.resize(num_rays, laser_scan.range_max);
+        
+        // Project 3D points into 2D laser scan
+        for (const auto& point : cloud->points) {
+            // Skip invalid points (NaN or Inf values)
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+                continue;
+            }
+            
+            // Calculate the angle for this point
+            double angle = std::atan2(point.y, point.x);
+            
+            // Normalize angle to range [angle_min, angle_max]
+            while (angle < angle_min) angle += 2 * M_PI;
+            while (angle > angle_max) angle -= 2 * M_PI;
+            
+            // Calculate the range
+            double range = std::sqrt(point.x * point.x + point.y * point.y);
+            
+            // Skip points outside our desired range
+            if (range < laser_scan.range_min || range > laser_scan.range_max) {
+                continue;
+            }
+            
+            // Calculate the index in the ranges array
+            int index = static_cast<int>((angle - angle_min) / angle_increment);
+            if (index >= 0 && index < num_rays) {
+                // Only update if this point is closer than what we've seen so far
+                if (range < laser_scan.ranges[index]) {
+                    laser_scan.ranges[index] = range;
+                }
+            }
+        }
+        
+        // Publish the laser scan
+        pubLaserScan_->publish(laser_scan);
+        RCLCPP_DEBUG(this->get_logger(), "Published laser scan with %d rays", num_rays);
+    }
+
+    // Filter points based on height thresholds for output only
+    PointCloudXYZI::Ptr filterPointsByHeight(const PointCloudXYZI::Ptr& cloud_in) {
+        PointCloudXYZI::Ptr cloud_filtered(new PointCloudXYZI());
+        
+        // Reserve memory for efficiency
+        cloud_filtered->reserve(cloud_in->size());
+        
+        // Filter points based on height (z-coordinate)
+        for (const auto& point : cloud_in->points) {
+            if (point.z >= ground_level_ && point.z <= max_height_) {
+                cloud_filtered->push_back(point);
+            }
+        }
+        
+        return cloud_filtered;
+    }
+
+    // Helper function to compute spatial hash for a point
+    std::string computeSpatialHash(const PointType& point) {
+        // Compute grid cell indices - use a finer grid for better precision
+        int x_idx = static_cast<int>(std::floor(point.x / (grid_cell_size * 0.8)));
+        int y_idx = static_cast<int>(std::floor(point.y / (grid_cell_size * 0.8)));
+        int z_idx = static_cast<int>(std::floor(point.z / (grid_cell_size * 0.8)));
+        
+        // Create a string hash
+        return std::to_string(x_idx) + "_" + std::to_string(y_idx) + "_" + std::to_string(z_idx);
+    }
+    
+    // Check if a point is likely to be part of a dynamic object
+    bool isLikelyDynamic(const PointType& point) {
+        // Skip dynamic filtering if disabled
+        if (!filter_dynamic_objects) {
+            return false;
+        }
+        
+        // Compute spatial hash for the point
+        std::string hash = computeSpatialHash(point);
+        
+        // Get current time
+        rclcpp::Time current_time = this->get_clock()->now();
+        
+        // If we've seen this cell before, update its stability
+        if (point_tracking_map.find(hash) != point_tracking_map.end()) {
+            PointTracker& tracker = point_tracking_map[hash];
+            
+            // If the point has been seen recently, check if it's moved
+            double time_diff = (current_time - tracker.last_seen).seconds();
+            
+            // Consider points seen within 0.75 seconds (less strict than 0.5)
+            if (time_diff < 0.75) { 
+                tracker.stability_counter++;
+                // Mark as static if stability threshold is reached - less strict
+                if (tracker.stability_counter >= static_point_stability) {
+                    tracker.is_static = true;
+                }
+            } else {
+                // If not seen for a while, reduce stability less aggressively
+                tracker.stability_counter = std::max(0, tracker.stability_counter - 1); 
+                // If stability drops below threshold, it's no longer considered static
+                if (tracker.stability_counter < static_point_stability) {
+                    tracker.is_static = false;
+                }
+            }
+            
+            // Update the last seen time
+            tracker.last_seen = current_time;
+            
+            // Return whether this point is likely dynamic (not static)
+            return !tracker.is_static;
+        } else {
+            // If we've never seen this cell before, add it to the map
+            PointTracker tracker;
+            tracker.stability_counter = 1;
+            tracker.last_seen = current_time;
+            tracker.is_static = false;
+            point_tracking_map[hash] = tracker;
+            
+            // New points have a chance to be considered static sooner
+            return tracker.stability_counter < 2; // Allow points to be added after 2 observations
+        }
+    }
+    
+    // Clean up old entries in the point tracking map
+    void cleanupPointTrackingMap() {
+        // Get current time
+        rclcpp::Time current_time = this->get_clock()->now();
+        
+        // Remove entries that haven't been seen in a while
+        std::vector<std::string> keys_to_remove;
+        for (const auto& pair : point_tracking_map) {
+            double time_diff = (current_time - pair.second.last_seen).seconds();
+            if (time_diff > 8.0) { // Keep points longer in memory (increased from 5.0s)
+                keys_to_remove.push_back(pair.first);
+            }
+        }
+        
+        // Remove old entries
+        for (const auto& key : keys_to_remove) {
+            point_tracking_map.erase(key);
+        }
+        
+        // Log cleanup info if removing many entries
+        if (keys_to_remove.size() > 1000) { // Increased threshold for logging
+            RCLCPP_INFO(this->get_logger(), "Cleaned up %zu old entries from point tracking map. Current size: %zu", 
+                      keys_to_remove.size(), point_tracking_map.size());
+        }
+    }
+
+    // Filter dynamic objects from point cloud - the results are stored in the point_dynamic array
+    // Returns the number of points classified as dynamic
+    int filterDynamicPoints() {
+        // Skip if dynamic filtering is disabled
+        if (!filter_dynamic_objects) {
+            return 0;
+        }
+        
+        // Clean up the point tracking map occasionally to prevent memory leaks
+        static int cleanup_counter = 0;
+        if (++cleanup_counter >= 70) { // Clean up less frequently (every 70 calls instead of 50)
+            cleanupPointTrackingMap();
+            cleanup_counter = 0;
+        }
+        
+        int dynamic_points = 0;
+        int total_points = 0;
+        
+        // Get blind parameter from preprocessor for consistency
+        double blind_sq = p_pre->blind * p_pre->blind;
+        
+        // Process all points in the current frame
+        for (int i = 0; i < feats_down_size; i++) {
+            total_points++;
+            
+            // Explicitly filter points too close to the LiDAR (robot antennas)
+            const PointType& point_body = feats_down_body->points[i];
+            double point_range_sq = point_body.x * point_body.x + 
+                                    point_body.y * point_body.y + 
+                                    point_body.z * point_body.z;
+            
+            if (point_range_sq < blind_sq) {
+                point_selected_surf[i] = false; // Filter out points too close to LiDAR
+                dynamic_points++;
+                continue;
+            }
+            
+            // Height filtering - slightly less aggressive parameters
+            if (feats_down_world->points[i].z < ground_level_ - 0.05 || 
+                feats_down_world->points[i].z > max_height_ + 0.05) {
+                point_selected_surf[i] = false; // Mark for skipping
+                dynamic_points++;
+                continue;
+            }
+            
+            // Check if this point is likely part of a dynamic object
+            if (isLikelyDynamic(feats_down_world->points[i])) {
+                dynamic_points++;
+                
+                // Mark this point for skipping in map_incremental
+                point_selected_surf[i] = false;
+            }
+        }
+        
+        // Log less frequently
+        static int log_counter = 0;
+        if (++log_counter >= 30) {
+            RCLCPP_INFO(this->get_logger(), "Dynamic points filtered: %d/%d (%.1f%%), Map hash table size: %zu",
+                      dynamic_points, total_points, 100.0 * dynamic_points / total_points, point_tracking_map.size());
+            log_counter = 0;
+        }
+        
+        return dynamic_points;
     }
 
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr pubLaserScan_; // Added LaserScan publisher
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;
@@ -1150,8 +2352,44 @@ private:
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
 
+    // Relocalization variables
+    bool relocalization_done_ = false;
+    bool relocalization_reset_needed_ = false;
+    
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;
+    
+    // Loop closure related
+    bool loop_closure_enabled_;
+    double loop_closure_search_radius_;
+    double loop_closure_min_distance_;
+    int loop_closure_detection_interval_;
+    double loop_closure_fitness_score_threshold_;
+    std::vector<std::shared_ptr<KeyFrame>> keyframes_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pubLoopClosureMarker_;
+    
+    // Parameters for height-based point filtering
+    double max_height_;
+    double ground_level_;
+    
+    // Parameters for dynamic object filtering
+    bool filter_dynamic_objects = true;   // Enable/disable dynamic object filtering
+    float dynamic_dist_threshold = 0.5;   // Distance threshold to consider a point part of a dynamic object (in meters)
+    int static_point_stability = 3;       // Number of consistent observations needed to consider a point static
+    
+    // Data structure to track point temporal consistency
+    struct PointTracker {
+        int stability_counter = 0;  // How many times this point has been consistently observed
+        rclcpp::Time last_seen;     // When the point was last observed
+        bool is_static = false;     // Whether the point is considered static (stable)
+    };
+    
+    // Grid-based spatial hash for efficient point tracking
+    float grid_cell_size = 0.2;     // Size of grid cells for spatial hashing (in meters)
+    std::unordered_map<std::string, PointTracker> point_tracking_map;  // Track points by spatial hash
+    
+    // Local map publishing
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
 };
 
 int main(int argc, char** argv)
@@ -1178,13 +2416,13 @@ int main(int argc, char** argv)
 
     if (runtime_pos_log)
     {
-        vector<double> t, s_vec, s_vec2, s_vec3, s_vec4, s_vec5, s_vec6, s_vec7;    
+        vector<double> t, s_vec, s_vec2, s_vec3, s_vec5, s_vec6, s_vec7;    
         FILE *fp2;
         string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
         fp2 = fopen(log_dir.c_str(),"w");
         fprintf(fp2,"time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree size st, tree size end, add point size, preprocess time\n");
         for (int i = 0;i<time_log_counter; i++){
-            fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot8[i]), int(s_plot10[i]), s_plot11[i]);
+            fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot10[i]), int(s_plot11[i]));
             t.push_back(T1[i]);
             s_vec.push_back(s_plot9[i]);
             s_vec2.push_back(s_plot3[i] + s_plot6[i]);

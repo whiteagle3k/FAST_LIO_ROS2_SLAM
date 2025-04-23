@@ -3,8 +3,8 @@
         feature_extract_enable: false
         point_filter_num: 3
         max_iteration: 3
-        filter_size_surf: 0.5
-        filter_size_map: 0.5
+        filter_size_surf: 0.1
+        filter_size_map: 0.1
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
         map_file_path: "./test.pcd"
@@ -19,7 +19,7 @@
         preprocess:
             lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
             scan_line:  4
-            blind: 0.5
+            blind: 1.0                  # Minimum distance (0.15m) to filter out robot antennas (~10cm from lidar)
             timestamp_unit: 3
             scan_rate: 10
 
@@ -35,6 +35,16 @@
             extrinsic_R: [ 1., 0., 0.,
                             0., 1., 0.,
                             0., 0., 1.]
+            relocalization_mode: false    # Set to true to enable re-localization mode
+            initial_pose: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]  # x, y, z, qw, qx, qy, qz
+            max_height: 5.0               # Maximum height for filtering points in output map
+            ground_level: -0.5            # Minimum height for filtering points in output map
+            
+            # Dynamic object filtering parameters
+            filter_dynamic_objects: true   # Enable/disable dynamic object filtering from the global map
+            dynamic_dist_threshold: 0.3    # Distance threshold to consider a point part of a dynamic object (less aggressive)
+            static_point_stability: 3      # Reduced from 5 to 3 to classify static points faster
+            grid_cell_size: 0.2            # Increased from 0.15 to 0.2 to be less precise/aggressive
 
         publish:
             path_en: true                # true: publish Path
@@ -48,3 +58,5 @@
             pcd_save_en: true
             interval: -1                 # how many LiDAR frames saved in each pcd file; 
                                         # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+            periodic_save: true         # Enable periodic map saving
+            save_interval: 60.0         # Save map every 60 seconds
