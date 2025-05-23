@@ -20,6 +20,7 @@
             lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
             scan_line:  4
             blind: 1.0                  # Minimum distance (0.15m) to filter out robot antennas (~10cm from lidar)
+            max_scan_range: 20.0        # Maximum scanning range in meters
             timestamp_unit: 3
             scan_rate: 10
 
@@ -37,14 +38,14 @@
                             0., 0., 1.]
             relocalization_mode: false    # Set to true to enable re-localization mode
             initial_pose: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]  # x, y, z, qw, qx, qy, qz
-            max_height: 5.0               # Maximum height for filtering points in output map
-            ground_level: -0.5            # Minimum height for filtering points in output map
+            max_height: 2.0               # Maximum height for filtering points in output map
+            ground_level: -0.3            # Minimum height for filtering points in output map
             
             # Dynamic object filtering parameters
             filter_dynamic_objects: true   # Enable/disable dynamic object filtering from the global map
             dynamic_dist_threshold: 0.3    # Distance threshold to consider a point part of a dynamic object (less aggressive)
             static_point_stability: 3      # Reduced from 5 to 3 to classify static points faster
-            grid_cell_size: 0.2            # Increased from 0.15 to 0.2 to be less precise/aggressive
+            grid_cell_size: 0.3            # Increased from 0.15 to 0.2 to be less precise/aggressive
 
         publish:
             path_en: true                # true: publish Path
@@ -60,3 +61,19 @@
                                         # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
             periodic_save: true         # Enable periodic map saving
             save_interval: 60.0         # Save map every 60 seconds
+
+        scan_context:
+            voxel_size: 0.7           # Voxel size for downsampling before scan context (meters)
+            max_height: 2.0           # Max height for points used in scan context
+            min_height: -0.3          # Min height for points used in scan context
+            min_intensity: 0.0        # Minimum intensity for points used in scan context
+            ring_num: 20              # Number of rings in scan context descriptor
+            sector_num: 60            # Number of sectors in scan context descriptor
+            max_radius: 20.0          # Max radius for scan context (meters)
+            dist_thres: 0.3           # Threshold for scan context distance
+            exclude_recent: 30        # Number of recent frames to exclude from loop detection
+        loop_closure:
+            search_radius: 10.0       # Search radius for loop closure (meters)
+            min_dist: 30.0            # Minimum distance for loop closure (meters)
+            detection_interval: 20    # Keyframe interval for loop closure detection
+            fitness_score_thresh: 0.3 # ICP fitness score threshold

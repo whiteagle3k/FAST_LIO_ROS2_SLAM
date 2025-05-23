@@ -36,12 +36,13 @@ Preprocess::~Preprocess()
 {
 }
 
-void Preprocess::set(bool feat_en, int lid_type, double bld, int pfilt_num)
+void Preprocess::set(bool feat_en, int lid_type, double bld, int pfilt_num, double max_range)
 {
   feature_enabled = feat_en;
   lidar_type = lid_type;
   blind = bld;
   point_filter_num = pfilt_num;
+  max_scan_range = max_range;
 }
 
 void Preprocess::process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg, PointCloudXYZI::Ptr& pcl_out)
@@ -519,6 +520,13 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     added_pt.intensity = pl_orig.points[i].intensity;
     added_pt.curvature = 0.;
 
+    // Calculate point distance
+    double point_dist = sqrt(added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z);
+    
+    // Skip points outside the desired range
+    if (point_dist > max_scan_range)
+      continue;
+
     int layer = pl_orig.points[i].line;
     double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
@@ -549,7 +557,7 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     yaw_last[layer] = yaw_angle;
     time_last[layer] = added_pt.curvature;
 
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+    if (point_dist > (blind * blind))
     {
       pl_surf.push_back(std::move(added_pt));
     }

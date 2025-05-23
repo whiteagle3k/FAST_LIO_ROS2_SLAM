@@ -69,6 +69,19 @@
 #include "scan_context.h"
 #include <filesystem>  // Add this include for std::filesystem
 #include <sensor_msgs/msg/laser_scan.hpp>
+#include <condition_variable>
+#include <string>
+#include <vector>
+#include <deque>
+#include <algorithm>
+#include <iostream>
+
+using std::string;
+using std::vector;
+using std::deque;
+using std::mutex;
+using std::condition_variable;
+using std::shared_ptr;
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -1108,6 +1121,21 @@ public:
         downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
         downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
 
+        RCLCPP_INFO(this->get_logger(), "Map height filtering: min=%f, max=%f", ground_level_, max_height_);
+
+        // After all other parameter declarations in LaserMappingNode constructor:
+        ScanContextParams sc_params;
+        sc_params.voxel_size = this->declare_parameter("scan_context.voxel_size", 0.7);
+        sc_params.max_height = this->declare_parameter("scan_context.max_height", 2.0);
+        sc_params.min_height = this->declare_parameter("scan_context.min_height", -0.3);
+        sc_params.min_intensity = this->declare_parameter("scan_context.min_intensity", 0.0);
+        sc_params.ring_num = this->declare_parameter("scan_context.ring_num", 20);
+        sc_params.sector_num = this->declare_parameter("scan_context.sector_num", 60);
+        sc_params.max_radius = this->declare_parameter("scan_context.max_radius", 20.0);
+        sc_params.dist_thres = this->declare_parameter("scan_context.dist_thres", 0.3);
+        sc_params.exclude_recent = this->declare_parameter("scan_context.exclude_recent", 30);
+        setScanContextParams(sc_params);
+
         // Loop closure parameters
         this->declare_parameter<bool>("loop_closure.enabled", true);
         this->declare_parameter<double>("loop_closure.search_radius", LOOP_CLOSURE_SEARCH_RADIUS);
@@ -1132,8 +1160,6 @@ public:
             RCLCPP_INFO(this->get_logger(), "  Detection interval: %d frames", loop_closure_detection_interval_);
             RCLCPP_INFO(this->get_logger(), "  Fitness score threshold: %.2f", loop_closure_fitness_score_threshold_);
         }
-
-        RCLCPP_INFO(this->get_logger(), "Map height filtering: min=%f, max=%f", ground_level_, max_height_);
     }
 
     ~LaserMappingNode()

@@ -18,22 +18,30 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/common/transforms.h>
 
-// Forward declare PointType since it's defined in preprocess.h
-// This avoids the include dependency
+// Forward declare PointType to avoid including preprocess.h and causing redefinition
 typedef pcl::PointXYZINormal PointType;
 
 // Scan Context parameters as constants
-const int SC_RING_NUM = 20;             // Number of rings in the scan context descriptor
-const int SC_SECTOR_NUM = 60;           // Number of sectors in the scan context descriptor
-const double SC_DIST_THRES = 0.3;       // Threshold for scan context distance
-const int NUM_EXCLUDE_RECENT = 30;      // Number of recent frames to exclude from loop detection
-const double SC_MAX_RADIUS = 80.0;      // Maximum radius for scan context
-
-// Loop closure parameters
 const double LOOP_CLOSURE_SEARCH_RADIUS = 10.0;   // Search radius for loop closure in meters
 const double LOOP_CLOSURE_MIN_DIST = 30.0;        // Minimum distance traveled to consider loop closure
 const int LOOP_CLOSURE_DETECTION_INTERVAL = 20;   // Keyframe interval for loop closure detection
 const double LOOP_CLOSURE_FITNESS_SCORE_THRESH = 0.3; // ICP fitness score threshold
+
+struct ScanContextParams {
+    int ring_num = 20;
+    int sector_num = 60;
+    double dist_thres = 0.3;
+    int exclude_recent = 30;
+    double max_radius = 20.0;
+    double voxel_size = 0.7;
+    double max_height = 2.0;
+    double min_height = -0.3;
+    double min_intensity = 0.0;
+};
+
+extern ScanContextParams g_sc_params;
+
+void setScanContextParams(const ScanContextParams& params);
 
 // Structure to hold keyframe data
 struct KeyFrame {

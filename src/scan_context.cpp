@@ -3,41 +3,49 @@
 #include <algorithm>
 #include <pcl/registration/icp.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/common/transforms.h>
+#include <limits>
+
+// Define the missing constant
+const double SC_DIST_THRES = 0.3; // Default scan context distance threshold
+
+ScanContextParams g_sc_params;
+
+void setScanContextParams(const ScanContextParams& params) {
+    g_sc_params = params;
+}
 
 // Generate scan context descriptor from point cloud
 Eigen::MatrixXd generateScanContext(const pcl::PointCloud<PointType>::Ptr& cloud) {
+    // Downsample cloud
+    pcl::VoxelGrid<PointType> voxel;
+    voxel.setLeafSize(g_sc_params.voxel_size, g_sc_params.voxel_size, g_sc_params.voxel_size);
+    pcl::PointCloud<PointType>::Ptr filtered(new pcl::PointCloud<PointType>());
+    voxel.setInputCloud(cloud);
+    voxel.filter(*filtered);
+
     // Initialize a matrix filled with zeros
-    Eigen::MatrixXd scan_context = Eigen::MatrixXd::Zero(SC_RING_NUM, SC_SECTOR_NUM);
+    Eigen::MatrixXd scan_context = Eigen::MatrixXd::Zero(g_sc_params.ring_num, g_sc_params.sector_num);
     
     // For each point in the point cloud
-    for (const auto& point : cloud->points) {
+    for (const auto& point : filtered->points) {
+        // Height/intensity filtering
+        if (point.z > g_sc_params.max_height || point.z < g_sc_params.min_height) continue;
+        if (point.intensity < g_sc_params.min_intensity) continue;
         // Calculate distance and angle
         double x = point.x;
         double y = point.y;
         double z = point.z;
-        
-        // Convert to polar coordinates
         double range = sqrt(x*x + y*y);
-        
-        // Skip too far points
-        if (range > SC_MAX_RADIUS) continue;
-        
-        // Calculate angle (0 to 360 degrees)
+        if (range > g_sc_params.max_radius) continue;
         double angle = atan2(y, x) * 180.0 / M_PI;
         if (angle < 0) angle += 360.0;
-        
-        // Calculate ring and sector indices
-        int ring_idx = static_cast<int>(SC_RING_NUM * range / SC_MAX_RADIUS);
-        int sector_idx = static_cast<int>(SC_SECTOR_NUM * angle / 360.0);
-        
-        // Bound checking
-        ring_idx = std::min(ring_idx, SC_RING_NUM - 1);
-        sector_idx = std::min(sector_idx, SC_SECTOR_NUM - 1);
-        
-        // Update the scan context with the maximum height
+        int ring_idx = static_cast<int>(g_sc_params.ring_num * range / g_sc_params.max_radius);
+        int sector_idx = static_cast<int>(g_sc_params.sector_num * angle / 360.0);
+        ring_idx = std::min(ring_idx, g_sc_params.ring_num - 1);
+        sector_idx = std::min(sector_idx, g_sc_params.sector_num - 1);
         scan_context(ring_idx, sector_idx) = std::max(scan_context(ring_idx, sector_idx), static_cast<double>(z));
     }
-    
     return scan_context;
 }
 
@@ -69,7 +77,7 @@ std::pair<int, double> findBestMatchingScanContext(
     int exclude_recent_num) {
     
     int best_match_idx = -1;
-    double best_score = SC_DIST_THRES; // Initialize with the threshold value
+    double best_score = g_sc_params.dist_thres; // Use parameter instead of undefined constant
     
     size_t keyframes_size = keyframes.size();
     if (keyframes_size <= static_cast<size_t>(exclude_recent_num)) {
