@@ -1905,9 +1905,8 @@ public:
             return false;
         }
 
-        // Build a richer set of initial hypotheses for global relocalization:
-        // 1) identity-centered search for unknown starts
-        // 2) initial_pose-centered search when provided by config/launch
+        // Build relocalization hypotheses.
+        // Prioritize persisted/configured seed first, then fall back to broad global search.
         auto make_guess = [](float tx, float ty, float tz, float yaw_rad) {
             Eigen::Matrix4f t = Eigen::Matrix4f::Identity();
             const float c = std::cos(yaw_rad);
@@ -1921,32 +1920,12 @@ public:
         };
 
         std::vector<Eigen::Matrix4f> initial_transformations;
-        initial_transformations.reserve(512);
+        initial_transformations.reserve(600);
 
-        // Always include pure identity as a baseline.
-        initial_transformations.push_back(Eigen::Matrix4f::Identity());
-
-        // Symmetric XY offsets and yaw bins improve convergence when start is far from map origin.
-        const std::vector<float> offsets_xy = {-15.0f, -10.0f, -5.0f, 0.0f, 5.0f, 10.0f, 15.0f};
-        const std::vector<float> yaw_bins = {
-            -static_cast<float>(M_PI), -3.0f * static_cast<float>(M_PI) / 4.0f,
-            -static_cast<float>(M_PI) / 2.0f, -static_cast<float>(M_PI) / 4.0f,
-             0.0f,
-             static_cast<float>(M_PI) / 4.0f,  static_cast<float>(M_PI) / 2.0f,
-             3.0f * static_cast<float>(M_PI) / 4.0f
-        };
-
-        for (float dx : offsets_xy) {
-            for (float dy : offsets_xy) {
-                for (float yaw : yaw_bins) {
-                    initial_transformations.push_back(make_guess(dx, dy, 0.0f, yaw));
-                }
-            }
-        }
-
-        // If configured, also center hypotheses around mapping.initial_pose.
+        // If configured or loaded from persisted pose, center hypotheses around mapping.initial_pose.
+        bool has_nondefault_seed = false;
         if (initial_pose.size() >= 7) {
-            const bool has_nondefault_seed =
+            has_nondefault_seed =
                 std::fabs(initial_pose[0]) > 1e-6 ||
                 std::fabs(initial_pose[1]) > 1e-6 ||
                 std::fabs(initial_pose[2]) > 1e-6 ||
@@ -1955,42 +1934,88 @@ public:
                 std::fabs(initial_pose[5]) > 1e-6 ||
                 std::fabs(initial_pose[6]) > 1e-6;
 
-            if (!has_nondefault_seed) {
-                RCLCPP_INFO(this->get_logger(), "Skipping mapping.initial_pose seed because it is default identity.");
-            } else {
-            const float seed_x = static_cast<float>(initial_pose[0]);
-            const float seed_y = static_cast<float>(initial_pose[1]);
-            const float seed_z = static_cast<float>(initial_pose[2]);
-            Eigen::Quaternionf q_seed(
-                static_cast<float>(initial_pose[3]), // qw
-                static_cast<float>(initial_pose[4]), // qx
-                static_cast<float>(initial_pose[5]), // qy
-                static_cast<float>(initial_pose[6])  // qz
-            );
-            q_seed.normalize();
-            const float seed_yaw = std::atan2(
-                2.0f * (q_seed.w() * q_seed.z() + q_seed.x() * q_seed.y()),
-                1.0f - 2.0f * (q_seed.y() * q_seed.y() + q_seed.z() * q_seed.z())
-            );
+            if (has_nondefault_seed) {
+                const float seed_x = static_cast<float>(initial_pose[0]);
+                const float seed_y = static_cast<float>(initial_pose[1]);
+                const float seed_z = static_cast<float>(initial_pose[2]);
+                Eigen::Quaternionf q_seed(
+                    static_cast<float>(initial_pose[3]), // qw
+                    static_cast<float>(initial_pose[4]), // qx
+                    static_cast<float>(initial_pose[5]), // qy
+                    static_cast<float>(initial_pose[6])  // qz
+                );
+                q_seed.normalize();
+                const float seed_yaw = std::atan2(
+                    2.0f * (q_seed.w() * q_seed.z() + q_seed.x() * q_seed.y()),
+                    1.0f - 2.0f * (q_seed.y() * q_seed.y() + q_seed.z() * q_seed.z())
+                );
 
-            // Try exact persisted/configured seed first (no perturbation), then expand around it.
-            initial_transformations.push_back(make_guess(seed_x, seed_y, seed_z, seed_yaw));
+                // First, dense local search around seed.
+                const std::vector<float> seed_offsets_xy_local = {-3.0f, -1.5f, 0.0f, 1.5f, 3.0f};
+                const std::vector<float> seed_yaw_local = {
+                    -static_cast<float>(M_PI) / 4.0f,
+                    -static_cast<float>(M_PI) / 8.0f,
+                     0.0f,
+                     static_cast<float>(M_PI) / 8.0f,
+                     static_cast<float>(M_PI) / 4.0f
+                };
 
-            for (float dx : offsets_xy) {
-                for (float dy : offsets_xy) {
-                    for (float yaw : yaw_bins) {
-                        if (dx == 0.0f && dy == 0.0f && yaw == 0.0f) {
-                            continue; // already added as exact seed above
+                // Try exact persisted/configured seed first (no perturbation).
+                initial_transformations.push_back(make_guess(seed_x, seed_y, seed_z, seed_yaw));
+
+                for (float dx : seed_offsets_xy_local) {
+                    for (float dy : seed_offsets_xy_local) {
+                        for (float dyaw : seed_yaw_local) {
+                            if (dx == 0.0f && dy == 0.0f && dyaw == 0.0f) {
+                                continue; // exact seed already added
+                            }
+                            initial_transformations.push_back(
+                                make_guess(seed_x + dx, seed_y + dy, seed_z, seed_yaw + dyaw));
                         }
-                        initial_transformations.push_back(
-                            make_guess(seed_x + dx, seed_y + dy, seed_z, seed_yaw + yaw));
                     }
                 }
-            }
 
-            RCLCPP_INFO(this->get_logger(),
-                        "Using mapping.initial_pose seed [%.2f, %.2f, %.2f], yaw %.2f rad",
-                        seed_x, seed_y, seed_z, seed_yaw);
+                // Then, coarse wider ring around seed for robustness.
+                const std::vector<float> seed_offsets_xy_wide = {-10.0f, -6.0f, -3.0f, 0.0f, 3.0f, 6.0f, 10.0f};
+                const std::vector<float> seed_yaw_wide = {
+                    -static_cast<float>(M_PI), -static_cast<float>(M_PI) / 2.0f, 0.0f, static_cast<float>(M_PI) / 2.0f
+                };
+                for (float dx : seed_offsets_xy_wide) {
+                    for (float dy : seed_offsets_xy_wide) {
+                        for (float dyaw : seed_yaw_wide) {
+                            if (dx == 0.0f && dy == 0.0f && dyaw == 0.0f) {
+                                continue;
+                            }
+                            initial_transformations.push_back(
+                                make_guess(seed_x + dx, seed_y + dy, seed_z, seed_yaw + dyaw));
+                        }
+                    }
+                }
+
+                RCLCPP_INFO(this->get_logger(),
+                            "Using mapping.initial_pose seed [%.2f, %.2f, %.2f], yaw %.2f rad",
+                            seed_x, seed_y, seed_z, seed_yaw);
+            }
+        }
+
+        // Add identity-centered fallback search.
+        // Keep this broad search only as backup when seed is not useful.
+        initial_transformations.push_back(Eigen::Matrix4f::Identity());
+        const std::vector<float> global_offsets_xy = {-15.0f, -10.0f, -5.0f, 0.0f, 5.0f, 10.0f, 15.0f};
+        const std::vector<float> global_yaw_bins = {
+            -static_cast<float>(M_PI), -3.0f * static_cast<float>(M_PI) / 4.0f,
+            -static_cast<float>(M_PI) / 2.0f, -static_cast<float>(M_PI) / 4.0f,
+             0.0f,
+             static_cast<float>(M_PI) / 4.0f,  static_cast<float>(M_PI) / 2.0f,
+             3.0f * static_cast<float>(M_PI) / 4.0f
+        };
+        if (!has_nondefault_seed) {
+            for (float dx : global_offsets_xy) {
+                for (float dy : global_offsets_xy) {
+                    for (float yaw : global_yaw_bins) {
+                        initial_transformations.push_back(make_guess(dx, dy, 0.0f, yaw));
+                    }
+                }
             }
         }
 
@@ -2175,12 +2200,14 @@ public:
         }
 
         // Format: stamp_sec x y z qw qx qy qz map_path
+        // Use "-" placeholder when map path is unknown, so parser always has 9 tokens.
+        const std::string map_path_token = loaded_map_path_.empty() ? "-" : loaded_map_path_;
         out << std::fixed << std::setprecision(9)
             << this->get_clock()->now().seconds() << " "
             << state_point.pos(0) << " " << state_point.pos(1) << " " << state_point.pos(2) << " "
             << state_point.rot.w() << " " << state_point.rot.x() << " "
             << state_point.rot.y() << " " << state_point.rot.z() << " "
-            << loaded_map_path_ << "\n";
+            << map_path_token << "\n";
         out.close();
 
         std::error_code ec;
@@ -2208,10 +2235,13 @@ public:
         double x = 0.0, y = 0.0, z = 0.0;
         double qw = 1.0, qx = 0.0, qy = 0.0, qz = 0.0;
         std::string saved_map_path;
-        in >> stamp_sec >> x >> y >> z >> qw >> qx >> qy >> qz >> saved_map_path;
-        if (!in.good() && !in.eof()) {
+        if (!(in >> stamp_sec >> x >> y >> z >> qw >> qx >> qy >> qz)) {
             RCLCPP_WARN(this->get_logger(), "Persisted pose file parse failed: %s", last_pose_file_path_.c_str());
             return false;
+        }
+        in >> saved_map_path;
+        if (saved_map_path == "-") {
+            saved_map_path.clear();
         }
 
         const double now_sec = this->get_clock()->now().seconds();
