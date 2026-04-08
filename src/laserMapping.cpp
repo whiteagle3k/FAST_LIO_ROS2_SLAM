@@ -913,6 +913,8 @@ public:
         this->declare_parameter("mapping.last_pose_save_interval_sec", 1.0);
         this->declare_parameter("mapping.last_pose_max_age_sec", 1800.0);
         this->declare_parameter("mapping.relocalization_early_accept_fitness", 2.0);
+        this->declare_parameter("mapping.relocalization_accept_fitness", 7.0);
+        this->declare_parameter("mapping.relocalization_low_fitness_fallback", 3.5);
         this->declare_parameter("pcd_save.periodic_save", false);
         this->declare_parameter("pcd_save.save_interval", 60.0);
         this->declare_parameter("mapping.suppress_warnings", false);
@@ -966,6 +968,8 @@ public:
         this->get_parameter_or<double>("mapping.last_pose_save_interval_sec", last_pose_save_interval_sec_, 1.0);
         this->get_parameter_or<double>("mapping.last_pose_max_age_sec", last_pose_max_age_sec_, 1800.0);
         this->get_parameter_or<double>("mapping.relocalization_early_accept_fitness", relocalization_early_accept_fitness_, 2.0);
+        this->get_parameter_or<double>("mapping.relocalization_accept_fitness", relocalization_accept_fitness_, 7.0);
+        this->get_parameter_or<double>("mapping.relocalization_low_fitness_fallback", relocalization_low_fitness_fallback_, 3.5);
         this->get_parameter_or<bool>("pcd_save.periodic_save", periodic_save, false);
         this->get_parameter_or<double>("pcd_save.save_interval", save_interval, 60.0);
         this->get_parameter_or<bool>("mapping.suppress_warnings", suppress_point_warnings, false);
@@ -1919,6 +1923,21 @@ public:
             return t;
         };
 
+        // Phase-1: always try a compact origin-centered set first (10 guesses).
+        std::vector<Eigen::Matrix4f> origin_transformations;
+        origin_transformations.reserve(10);
+        origin_transformations.push_back(Eigen::Matrix4f::Identity()); // 0,0,0 yaw 0
+        origin_transformations.push_back(make_guess(0.0f, 0.0f, 0.0f,  static_cast<float>(M_PI) / 4.0f));
+        origin_transformations.push_back(make_guess(0.0f, 0.0f, 0.0f, -static_cast<float>(M_PI) / 4.0f));
+        origin_transformations.push_back(make_guess(0.0f, 0.0f, 0.0f,  static_cast<float>(M_PI) / 2.0f));
+        origin_transformations.push_back(make_guess(0.0f, 0.0f, 0.0f, -static_cast<float>(M_PI) / 2.0f));
+        origin_transformations.push_back(make_guess(0.0f, 0.0f, 0.0f,  3.0f * static_cast<float>(M_PI) / 4.0f));
+        origin_transformations.push_back(make_guess(0.0f, 0.0f, 0.0f, -3.0f * static_cast<float>(M_PI) / 4.0f));
+        origin_transformations.push_back(make_guess(0.0f, 0.0f, 0.0f,  static_cast<float>(M_PI)));
+        origin_transformations.push_back(make_guess(2.0f, 0.0f, 0.0f, 0.0f));
+        origin_transformations.push_back(make_guess(-2.0f, 0.0f, 0.0f, 0.0f));
+
+        // Phase-2: current normal relocalization (seed/global hypotheses).
         std::vector<Eigen::Matrix4f> initial_transformations;
         initial_transformations.reserve(600);
 
@@ -2025,8 +2044,12 @@ public:
             }
         };
 
-        RCLCPP_INFO(this->get_logger(), "Relocalization ICP will evaluate %zu initial hypotheses",
-                    initial_transformations.size());
+        RCLCPP_INFO(this->get_logger(), "Relocalization phase-1 (origin) will evaluate %zu initial hypotheses",
+                    origin_transformations.size());
+        if (has_nondefault_seed) {
+            RCLCPP_INFO(this->get_logger(), "Relocalization phase-2 (seed/global) prepared with %zu initial hypotheses",
+                        initial_transformations.size());
+        }
         
         // Store best result
         bool converged = false;
@@ -2040,8 +2063,8 @@ public:
         // accept early instead of evaluating all hypotheses.
         const float early_accept_fitness = static_cast<float>(relocalization_early_accept_fitness_);
 
-        // Try each initial transformation
-        for (size_t i = 0; i < initial_transformations.size(); i++) {
+        auto run_icp_hypotheses = [&](const std::vector<Eigen::Matrix4f>& hypotheses, const std::string& phase_tag) {
+            for (size_t i = 0; i < hypotheses.size(); i++) {
             // Perform ICP to find the transformation
             pcl::IterativeClosestPoint<PointType, PointType> icp;
             // More tolerant correspondence improves recovery for 10m+ jumps.
@@ -2056,19 +2079,19 @@ public:
             icp.setInputTarget(target_filtered);
             
             // Set initial alignment
-            Eigen::Matrix4f init_guess = initial_transformations[i];
+            Eigen::Matrix4f init_guess = hypotheses[i];
             
-            if (i % 25 == 0 || i + 1 == initial_transformations.size()) {
-                RCLCPP_INFO(this->get_logger(), "Trying initial transformation %zu/%zu",
-                            i + 1, initial_transformations.size());
+            if (i % 25 == 0 || i + 1 == hypotheses.size()) {
+                RCLCPP_INFO(this->get_logger(), "[%s] Trying initial transformation %zu/%zu",
+                            phase_tag.c_str(), i + 1, hypotheses.size());
             }
             
             PointCloudXYZI::Ptr aligned(new PointCloudXYZI());
             icp.align(*aligned, init_guess);
             
             float fitness_score = icp.getFitnessScore();
-            RCLCPP_INFO(this->get_logger(), "Initial guess %zu: Converged=%d, Fitness score=%f", 
-                       i, icp.hasConverged(), fitness_score);
+            RCLCPP_INFO(this->get_logger(), "[%s] Initial guess %zu: Converged=%d, Fitness score=%f", 
+                       phase_tag.c_str(), i, icp.hasConverged(), fitness_score);
             
             if (icp.hasConverged()) {
                 converged_count++;
@@ -2092,15 +2115,30 @@ public:
                 best_guess_idx = i;
                 converged_count++;
                 RCLCPP_INFO(this->get_logger(),
-                            "Early accepting relocalization candidate at guess %zu with fitness %.6f",
-                            i, fitness_score);
-                break;
+                            "[%s] Early accepting relocalization candidate at guess %zu with fitness %.6f",
+                            phase_tag.c_str(), i, fitness_score);
+                return true;
             }
+        }
+            return false;
+        };
+
+        // Phase-1: force origin attempt first.
+        run_icp_hypotheses(origin_transformations, "origin");
+        bool phase1_accept = (converged && best_fitness_score < static_cast<float>(relocalization_accept_fitness_)) ||
+                             (has_finite_candidate && best_fitness_score < static_cast<float>(relocalization_low_fitness_fallback_));
+
+        // If origin attempt did not pass and a last/config seed exists, continue with normal seeded relocalization.
+        if (!phase1_accept && has_nondefault_seed) {
+            RCLCPP_INFO(this->get_logger(),
+                        "Origin-first relocalization not accepted (best=%.6f). Continuing with seed/global hypotheses.",
+                        best_fitness_score);
+            run_icp_hypotheses(initial_transformations, "seed");
         }
         
         RCLCPP_INFO(this->get_logger(),
-                    "Relocalization ICP summary: converged=%zu/%zu, best_guess=%zu, best_score=%.6f, best_hasConverged=%d",
-                    converged_count, initial_transformations.size(), best_guess_idx, best_fitness_score, converged);
+                    "Relocalization ICP summary: converged=%zu, best_guess=%zu, best_score=%.6f, best_hasConverged=%d",
+                    converged_count, best_guess_idx, best_fitness_score, converged);
 
         // Refine the best coarse candidate with denser clouds and tighter correspondence.
         // This often drops fitness significantly when coarse ICP is near the correct basin.
@@ -2152,8 +2190,10 @@ public:
             converged = true;
         }
 
-        const bool accept_converged = converged && best_fitness_score < 7.0f;
-        const bool accept_low_fitness_fallback = has_finite_candidate && best_fitness_score < 3.5f;
+        const bool accept_converged = converged &&
+            best_fitness_score < static_cast<float>(relocalization_accept_fitness_);
+        const bool accept_low_fitness_fallback = has_finite_candidate &&
+            best_fitness_score < static_cast<float>(relocalization_low_fitness_fallback_);
 
         // Accept either:
         // 1) normal converged ICP with practical threshold, or
@@ -2764,6 +2804,8 @@ private:
     double last_pose_save_interval_sec_ = 1.0;
     double last_pose_max_age_sec_ = 1800.0;
     double relocalization_early_accept_fitness_ = 2.0;
+    double relocalization_accept_fitness_ = 7.0;
+    double relocalization_low_fitness_fallback_ = 3.5;
 };
 
 int main(int argc, char** argv)

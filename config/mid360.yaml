@@ -41,6 +41,8 @@
             last_pose_save_interval_sec: 1.0  # Save pose every N seconds
             last_pose_max_age_sec: 1800.0     # Ignore persisted pose older than this
             relocalization_early_accept_fitness: 5.0  # Early-accept ICP score threshold
+            relocalization_accept_fitness: 10.0 # Accept ICP score threshold   # default 7.0
+            relocalization_low_fitness_fallback: 5.0 # Low fitness fallback threshold    # default 3.5
             max_height: 15.0              # Maximum height for filtering points in output map
             ground_level: -15.0            # Minimum height for filtering points in output map
             # max_height: 10.0               # Maximum height for filtering points in output map
