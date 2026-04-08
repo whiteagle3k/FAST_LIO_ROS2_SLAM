@@ -40,7 +40,7 @@
             persist_last_pose: true       # Save latest stable pose for restart seeding
             last_pose_save_interval_sec: 1.0  # Save pose every N seconds
             last_pose_max_age_sec: 1800.0     # Ignore persisted pose older than this
-            relocalization_early_accept_fitness: 3.0  # Early-accept ICP score threshold
+            relocalization_early_accept_fitness: 5.0  # Early-accept ICP score threshold
             max_height: 15.0              # Maximum height for filtering points in output map
             ground_level: -15.0            # Minimum height for filtering points in output map
             # max_height: 10.0               # Maximum height for filtering points in output map

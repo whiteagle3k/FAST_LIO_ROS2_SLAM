@@ -273,7 +273,7 @@ void lasermap_fov_segment()
         for (int i = 0; i < 3; i++){
             LocalMap_Points.vertex_min[i] = pos_LiD(i) - cube_len / 2.0;
             LocalMap_Points.vertex_max[i] = pos_LiD(i) + cube_len / 2.0;
-        }
+        };
         Localmap_Initialized = true;
         return;
     }
@@ -1999,25 +1999,31 @@ public:
         }
 
         // Add identity-centered fallback search.
-        // Keep this broad search only as backup when seed is not useful.
+        // Even when we have a seed, keep a coarse global sweep for large jumps / stale seed.
         initial_transformations.push_back(Eigen::Matrix4f::Identity());
-        const std::vector<float> global_offsets_xy = {-15.0f, -10.0f, -5.0f, 0.0f, 5.0f, 10.0f, 15.0f};
-        const std::vector<float> global_yaw_bins = {
-            -static_cast<float>(M_PI), -3.0f * static_cast<float>(M_PI) / 4.0f,
-            -static_cast<float>(M_PI) / 2.0f, -static_cast<float>(M_PI) / 4.0f,
-             0.0f,
-             static_cast<float>(M_PI) / 4.0f,  static_cast<float>(M_PI) / 2.0f,
-             3.0f * static_cast<float>(M_PI) / 4.0f
-        };
-        if (!has_nondefault_seed) {
-            for (float dx : global_offsets_xy) {
-                for (float dy : global_offsets_xy) {
-                    for (float yaw : global_yaw_bins) {
-                        initial_transformations.push_back(make_guess(dx, dy, 0.0f, yaw));
+        const std::vector<float> global_offsets_xy = has_nondefault_seed
+            ? std::vector<float>{-30.0f, -20.0f, -10.0f, 0.0f, 10.0f, 20.0f, 30.0f}
+            : std::vector<float>{-15.0f, -10.0f, -5.0f, 0.0f, 5.0f, 10.0f, 15.0f};
+        const std::vector<float> global_yaw_bins = has_nondefault_seed
+            ? std::vector<float>{-static_cast<float>(M_PI), -static_cast<float>(M_PI) / 2.0f, 0.0f, static_cast<float>(M_PI) / 2.0f}
+            : std::vector<float>{
+                -static_cast<float>(M_PI), -3.0f * static_cast<float>(M_PI) / 4.0f,
+                -static_cast<float>(M_PI) / 2.0f, -static_cast<float>(M_PI) / 4.0f,
+                 0.0f,
+                 static_cast<float>(M_PI) / 4.0f,  static_cast<float>(M_PI) / 2.0f,
+                 3.0f * static_cast<float>(M_PI) / 4.0f
+            };
+        for (float dx : global_offsets_xy) {
+            for (float dy : global_offsets_xy) {
+                for (float yaw : global_yaw_bins) {
+                    // Avoid duplicate identity guess.
+                    if (dx == 0.0f && dy == 0.0f && yaw == 0.0f) {
+                        continue;
                     }
+                    initial_transformations.push_back(make_guess(dx, dy, 0.0f, yaw));
                 }
             }
-        }
+        };
 
         RCLCPP_INFO(this->get_logger(), "Relocalization ICP will evaluate %zu initial hypotheses",
                     initial_transformations.size());
@@ -2038,8 +2044,8 @@ public:
         for (size_t i = 0; i < initial_transformations.size(); i++) {
             // Perform ICP to find the transformation
             pcl::IterativeClosestPoint<PointType, PointType> icp;
-            // Increase max correspondence distance to handle larger displacements
-            icp.setMaxCorrespondenceDistance(10.0);
+            // More tolerant correspondence improves recovery for 10m+ jumps.
+            icp.setMaxCorrespondenceDistance(20.0);
             // Increase max iterations for more thorough alignment
             icp.setMaximumIterations(300);
             icp.setTransformationEpsilon(1e-4);
@@ -2096,11 +2102,61 @@ public:
                     "Relocalization ICP summary: converged=%zu/%zu, best_guess=%zu, best_score=%.6f, best_hasConverged=%d",
                     converged_count, initial_transformations.size(), best_guess_idx, best_fitness_score, converged);
 
-        const bool accept_converged = converged && best_fitness_score < 5.0f;
-        const bool accept_low_fitness_fallback = has_finite_candidate && best_fitness_score < 2.5f;
+        // Refine the best coarse candidate with denser clouds and tighter correspondence.
+        // This often drops fitness significantly when coarse ICP is near the correct basin.
+        float refined_fitness_score = std::numeric_limits<float>::max();
+        bool refined_converged = false;
+        Eigen::Matrix4f refined_transformation = best_transformation;
+        if (has_finite_candidate) {
+            PointCloudXYZI::Ptr source_refined(new PointCloudXYZI());
+            PointCloudXYZI::Ptr target_refined(new PointCloudXYZI());
+            pcl::VoxelGrid<PointType> refine_filter;
+            // Keep this conservative to avoid voxel overflow while preserving structure.
+            refine_filter.setLeafSize(0.15f, 0.15f, 0.15f);
+            refine_filter.setInputCloud(source_cloud);
+            refine_filter.filter(*source_refined);
+            refine_filter.setInputCloud(target_cloud);
+            refine_filter.filter(*target_refined);
+
+            if (!source_refined->empty() && !target_refined->empty()) {
+                pcl::IterativeClosestPoint<PointType, PointType> icp_refine;
+                icp_refine.setInputSource(source_refined);
+                icp_refine.setInputTarget(target_refined);
+                icp_refine.setMaxCorrespondenceDistance(4.0);
+                icp_refine.setMaximumIterations(120);
+                icp_refine.setTransformationEpsilon(1e-5);
+                icp_refine.setEuclideanFitnessEpsilon(1e-5);
+
+                PointCloudXYZI refined_aligned;
+                icp_refine.align(refined_aligned, best_transformation);
+                refined_converged = icp_refine.hasConverged();
+                refined_fitness_score = icp_refine.getFitnessScore();
+                if (refined_converged && std::isfinite(refined_fitness_score)) {
+                    refined_transformation = icp_refine.getFinalTransformation();
+                }
+                RCLCPP_INFO(this->get_logger(),
+                            "Relocalization refine ICP: converged=%d, score=%.6f (coarse=%.6f)",
+                            refined_converged, refined_fitness_score, best_fitness_score);
+            } else {
+                RCLCPP_WARN(this->get_logger(),
+                            "Refinement clouds empty (src=%zu, tgt=%zu), skipping refine step",
+                            source_refined->size(), target_refined->size());
+            }
+        }
+
+        // Prefer refined result if available.
+        if (refined_converged && std::isfinite(refined_fitness_score) &&
+            refined_fitness_score < best_fitness_score) {
+            best_fitness_score = refined_fitness_score;
+            best_transformation = refined_transformation;
+            converged = true;
+        }
+
+        const bool accept_converged = converged && best_fitness_score < 7.0f;
+        const bool accept_low_fitness_fallback = has_finite_candidate && best_fitness_score < 3.5f;
 
         // Accept either:
-        // 1) normal converged ICP with standard threshold, or
+        // 1) normal converged ICP with practical threshold, or
         // 2) very low-fitness fallback (for platforms where hasConverged is unstable).
         if (accept_converged || accept_low_fitness_fallback) {
             if (!accept_converged && accept_low_fitness_fallback) {
