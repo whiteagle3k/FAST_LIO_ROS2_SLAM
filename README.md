@@ -184,7 +184,106 @@ roslaunch fast_lio mapping_velodyne.launch
 rosbag play YOUR_DOWNLOADED.bag
 ```
 
-## 5.Implementation on UAV
+## 5. Re-localization (Mid-360 fork)
+
+This fork adds re-localization support on top of FAST-LIO mapping:
+
+1. If `PCD/global_map.pcd` exists, the node loads it at startup and enters re-localization mode.
+2. Incoming scans are accumulated into a local cloud.
+3. ICP-based matching is attempted to estimate the initial global pose.
+4. On success, EKF/map state are reset to the matched pose and normal mapping/localization continues.
+
+### 5.1 Startup pose persistence (recommended)
+
+To improve restart behavior, this fork can persist the latest stable pose and reuse it as an initial seed:
+
+- Pose file: `PCD/last_pose.txt`
+- Save policy: periodic, atomic write (`.tmp` then rename)
+- Seed policy on startup:
+  - accepted only if file is fresh enough
+  - accepted only if saved map path matches current loaded map
+  - rejected if quaternion is invalid
+
+This helps a lot when restarting away from map origin (for example 10-15 m), where pure global ICP initialization may fail.
+
+### 5.2 Relevant parameters (`config/mid360.yaml`)
+
+Under `mapping`:
+
+- `relocalization_mode`: enable/disable re-localization mode
+- `initial_pose`: optional static seed `[x, y, z, qw, qx, qy, qz]`
+  - default identity is treated as "no explicit seed"
+- `persist_last_pose`: enable saving current stable pose for restart seeding
+- `last_pose_save_interval_sec`: pose save period (seconds)
+- `last_pose_max_age_sec`: maximum accepted age of persisted pose (seconds)
+
+Current defaults in this repo:
+
+- `persist_last_pose: true`
+- `last_pose_save_interval_sec: 1.0`
+- `last_pose_max_age_sec: 1800.0`
+
+### 5.3 Quick validation flow
+
+1. Start system and let EKF initialize.
+2. Move robot, wait a few seconds, and confirm `PCD/last_pose.txt` appears.
+3. Restart node with `PCD/global_map.pcd` present.
+4. Check logs for "Loaded persisted initial pose seed".
+5. Verify re-localization converges faster and from farther startup offsets.
+
+### 5.4 Troubleshooting re-localization
+
+- Symptom: Works near origin but fails at 10-15 m.
+  - Likely cause: poor global initialization for ICP.
+  - Action: ensure `persist_last_pose` is enabled and `PCD/last_pose.txt` is being refreshed before restart.
+
+- Symptom: "Persisted pose too old ... ignoring."
+  - Likely cause: robot was off for longer than accepted seed age.
+  - Action: increase `mapping.last_pose_max_age_sec` or create a fresh pose by running the robot briefly.
+
+- Symptom: "Persisted pose map mismatch ... ignoring seed."
+  - Likely cause: `last_pose` belongs to a different map file/session.
+  - Action: keep the same `global_map.pcd` across restarts or remove stale `PCD/last_pose.txt`.
+
+- Symptom: Re-localization repeatedly fails with high ICP fitness.
+  - Likely cause: insufficient overlap or strong scene changes (dynamic objects, moved furniture/vehicles).
+  - Action: restart from a more distinctive/static area, collect more stationary scans before relocalization attempt, and verify the loaded map quality.
+
+- Symptom: Re-localization is unstable right after startup.
+  - Likely cause: seed is saved before odometry is stable.
+  - Action: make sure EKF has initialized and robot has a short stable run before expecting high-quality persisted seed.
+
+- Recommended tuning order:
+  1. Confirm map and pose file paths (`PCD/global_map.pcd`, `PCD/last_pose.txt`).
+  2. Validate seed loading log messages at startup.
+  3. Tune only one parameter at a time, starting from `last_pose_max_age_sec`, then relocalization behavior parameters.
+
+#### Example startup logs
+
+Good (seed accepted and used):
+
+```text
+[INFO] Found existing map at .../PCD/global_map.pcd, attempting to load it
+[INFO] Loaded map with 123456 points from .../PCD/global_map.pcd
+[INFO] Loaded persisted initial pose seed: [12.34, -4.56, 0.12], q=[0.9987, 0.0001, -0.0012, 0.0500], age 8.4 sec
+[INFO] Map loaded successfully, enabling relocalization mode
+[INFO] Relocalization ICP will evaluate 785 initial hypotheses
+[INFO] Relocalization successful! Position: [12.20, -4.49, 0.10], ...
+```
+
+Bad (seed rejected, fallback to global search):
+
+```text
+[INFO] Found existing map at .../PCD/global_map.pcd, attempting to load it
+[WARN] Persisted pose too old (4120.3 sec > 1800.0 sec), ignoring.
+# or:
+[WARN] Persisted pose map mismatch, ignoring seed. saved=.../map_old.pcd current=.../global_map.pcd
+[INFO] Map loaded successfully, enabling relocalization mode
+[INFO] Relocalization ICP will evaluate 393 initial hypotheses
+[WARN] All ICP attempts failed to find a good match. Best fitness score: ...
+```
+
+## 6.Implementation on UAV
 In order to validate the robustness and computational efficiency of FAST-LIO in actual mobile robots, we build a small-scale quadrotor which can carry a Livox Avia LiDAR with 70 degree FoV and a DJI Manifold 2-C onboard computer with a 1.8 GHz Intel i7-8550U CPU and 8 G RAM, as shown in below.
 
 The main structure of this UAV is 3d printed (Aluminum or PLA), the .stl file will be open-sourced in the future.
@@ -194,6 +293,6 @@ The main structure of this UAV is 3d printed (Aluminum or PLA), the .stl file wi
     <img src="doc/uav_system.png" width=57% >
 </div>
 
-## 6.Acknowledgments
+## 7.Acknowledgments
 
 Thanks for LOAM(J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time), [Livox_Mapping](https://github.com/Livox-SDK/livox_mapping), [LINS](https://github.com/ChaoqinRobotics/LINS---LiDAR-inertial-SLAM) and [Loam_Livox](https://github.com/hku-mars/loam_livox).

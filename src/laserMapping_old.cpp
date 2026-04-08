@@ -66,7 +66,6 @@
 #include <pcl/registration/icp.h>
 #include <iomanip>
 #include <sstream>
-#include <limits>
 #include "scan_context.h"
 #include <filesystem>  // Add this include for std::filesystem
 #include <sensor_msgs/msg/laser_scan.hpp>
@@ -909,10 +908,6 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
         this->declare_parameter("mapping.relocalization_mode", false);
         this->declare_parameter("mapping.initial_pose", std::vector<double>{0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0});
-        this->declare_parameter("mapping.persist_last_pose", true);
-        this->declare_parameter("mapping.last_pose_save_interval_sec", 1.0);
-        this->declare_parameter("mapping.last_pose_max_age_sec", 1800.0);
-        this->declare_parameter("mapping.relocalization_early_accept_fitness", 2.0);
         this->declare_parameter("pcd_save.periodic_save", false);
         this->declare_parameter("pcd_save.save_interval", 60.0);
         this->declare_parameter("mapping.suppress_warnings", false);
@@ -962,10 +957,6 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
         this->get_parameter_or<bool>("mapping.relocalization_mode", relocalization_mode, false);
         this->get_parameter_or<vector<double>>("mapping.initial_pose", initial_pose, vector<double>{0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0});
-        this->get_parameter_or<bool>("mapping.persist_last_pose", persist_last_pose_enabled_, true);
-        this->get_parameter_or<double>("mapping.last_pose_save_interval_sec", last_pose_save_interval_sec_, 1.0);
-        this->get_parameter_or<double>("mapping.last_pose_max_age_sec", last_pose_max_age_sec_, 1800.0);
-        this->get_parameter_or<double>("mapping.relocalization_early_accept_fitness", relocalization_early_accept_fitness_, 2.0);
         this->get_parameter_or<bool>("pcd_save.periodic_save", periodic_save, false);
         this->get_parameter_or<double>("pcd_save.save_interval", save_interval, 60.0);
         this->get_parameter_or<bool>("mapping.suppress_warnings", suppress_point_warnings, false);
@@ -1084,13 +1075,10 @@ public:
         // Add automatic map loading and relocalization
         std::string pcd_dir = string(ROOT_DIR) + "PCD/";
         std::string default_map_path = pcd_dir + "global_map.pcd";
-        last_pose_file_path_ = pcd_dir + "last_pose.txt";
         if (std::filesystem::exists(default_map_path)) {
             RCLCPP_INFO(this->get_logger(), "Found existing map at %s, attempting to load it", default_map_path.c_str());
             bool load_success = loadMap(default_map_path);
             if (load_success) {
-                // Try to seed relocalization from the most recent persisted pose.
-                loadLastPoseSeed();
                 RCLCPP_INFO(this->get_logger(), "Map loaded successfully, enabling relocalization mode");
                 // Enable relocalization automatically when map is loaded
                 relocalization_mode = true;
@@ -1102,14 +1090,6 @@ public:
             } else {
                 RCLCPP_WARN(this->get_logger(), "Failed to load map, continuing without relocalization");
             }
-        }
-
-        if (persist_last_pose_enabled_ && last_pose_save_interval_sec_ > 0.0) {
-            pose_save_timer_ = this->create_wall_timer(
-                std::chrono::duration<double>(last_pose_save_interval_sec_),
-                std::bind(&LaserMappingNode::saveLastPoseTick, this));
-            RCLCPP_INFO(this->get_logger(), "Last-pose persistence enabled: %s (interval %.2f sec, max age %.1f sec)",
-                        last_pose_file_path_.c_str(), last_pose_save_interval_sec_, last_pose_max_age_sec_);
         }
         
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
@@ -1175,7 +1155,6 @@ public:
         
         RCLCPP_INFO(this->get_logger(), "Loaded map with %lu points from %s", 
                     loaded_map->size(), map_path.c_str());
-        loaded_map_path_ = map_path;
         
         // Clear current map using DeleteTree() method
         ikdtree.InitializeKDTree(); // Reset the tree with default parameters
@@ -1225,8 +1204,6 @@ public:
         bool success = loadMap(request->map_path);
         response->success = success;
         if (success) {
-            // Also refresh relocalization seed when map is loaded via service.
-            loadLastPoseSeed();
             response->message = "Map loaded successfully";
         } else {
             response->message = "Failed to load map";
@@ -1513,28 +1490,11 @@ public:
         
         RCLCPP_INFO(this->get_logger(), "Saving periodic map snapshot...");
         
-        // Ensure PCD output directories exist
+        // Ensure PCD directory exists
         std::string pcd_dir = string(ROOT_DIR) + "PCD/";
-        std::string pcd_tmp_dir = pcd_dir + "tmp/";
         if (!std::filesystem::exists(pcd_dir)) {
             RCLCPP_INFO(this->get_logger(), "Creating PCD directory: %s", pcd_dir.c_str());
-            std::error_code ec;
-            std::filesystem::create_directories(pcd_dir, ec);
-            if (ec) {
-                RCLCPP_ERROR(this->get_logger(), "Failed to create PCD directory %s: %s",
-                            pcd_dir.c_str(), ec.message().c_str());
-                return;
-            }
-        }
-        if (!std::filesystem::exists(pcd_tmp_dir)) {
-            RCLCPP_INFO(this->get_logger(), "Creating PCD tmp directory: %s", pcd_tmp_dir.c_str());
-            std::error_code ec;
-            std::filesystem::create_directories(pcd_tmp_dir, ec);
-            if (ec) {
-                RCLCPP_ERROR(this->get_logger(), "Failed to create PCD tmp directory %s: %s",
-                            pcd_tmp_dir.c_str(), ec.message().c_str());
-                return;
-            }
+            std::filesystem::create_directories(pcd_dir);
         }
         
         // Generate timestamped filename for periodic saves
@@ -1559,17 +1519,12 @@ public:
         PointCloudXYZI::Ptr filtered_map = filterPointsByHeight(global_map);
         
         // Use timestamped filename format for periodic saves
-        std::string periodic_map_path(pcd_tmp_dir + "Global_Map_" + timestamp_str + ".pcd");
+        std::string periodic_map_path(pcd_dir + "tmp/Global_Map_" + timestamp_str + ".pcd");
         pcl::PCDWriter pcd_writer;
-        int write_ret = pcd_writer.writeBinary(periodic_map_path, *filtered_map);
-        if (write_ret != 0) {
-            RCLCPP_ERROR(this->get_logger(), "Periodic map save failed (ret=%d) path=%s points=%zu",
-                        write_ret, periodic_map_path.c_str(), filtered_map->points.size());
-            return;
-        }
+        pcd_writer.writeBinary(periodic_map_path, *filtered_map);
         
         // Save trajectory
-        std::string trajectory_path = pcd_tmp_dir + "trajectory_" + timestamp_str + ".txt";
+        std::string trajectory_path = pcd_dir + "tmp/trajectory_" + timestamp_str + ".txt";
         std::ofstream trajectory_file(trajectory_path);
         
         if (trajectory_file.is_open()) {
@@ -1591,30 +1546,11 @@ public:
     {
         RCLCPP_INFO(this->get_logger(), "Saving map to PCD file...");
         
-        // Ensure PCD output directories exist
+        // Ensure PCD directory exists
         std::string pcd_dir = string(ROOT_DIR) + "PCD/";
-        std::string pcd_tmp_dir = pcd_dir + "tmp/";
         if (!std::filesystem::exists(pcd_dir)) {
             RCLCPP_INFO(this->get_logger(), "Creating PCD directory: %s", pcd_dir.c_str());
-            std::error_code ec;
-            std::filesystem::create_directories(pcd_dir, ec);
-            if (ec) {
-                response->success = false;
-                response->message = "Failed to create PCD directory: " + pcd_dir + " (" + ec.message() + ")";
-                RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
-                return true;
-            }
-        }
-        if (!std::filesystem::exists(pcd_tmp_dir)) {
-            RCLCPP_INFO(this->get_logger(), "Creating PCD tmp directory: %s", pcd_tmp_dir.c_str());
-            std::error_code ec;
-            std::filesystem::create_directories(pcd_tmp_dir, ec);
-            if (ec) {
-                response->success = false;
-                response->message = "Failed to create PCD tmp directory: " + pcd_tmp_dir + " (" + ec.message() + ")";
-                RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
-                return true;
-            }
+            std::filesystem::create_directories(pcd_dir);
         }
         
         // Generate timestamped filename
@@ -1639,7 +1575,7 @@ public:
         PointCloudXYZI::Ptr filtered_map = filterPointsByHeight(global_map);
         
         // Save trajectory
-        std::string trajectory_path = pcd_tmp_dir + "trajectory_" + timestamp_str + ".txt";
+        std::string trajectory_path = pcd_dir + "tmp/trajectory_" + timestamp_str + ".txt";
         std::ofstream trajectory_file(trajectory_path);
         
         if (trajectory_file.is_open()) {
@@ -1656,15 +1592,9 @@ public:
         }
         
         // Save the map
-        std::string pcd_path = pcd_tmp_dir + "Global_Map_" + timestamp_str + ".pcd";
+        std::string pcd_path = pcd_dir + "tmp/Global_Map_" + timestamp_str + ".pcd";
         pcl::PCDWriter pcd_writer;
-        int write_ret = pcd_writer.writeBinary(pcd_path, *filtered_map);
-        if (write_ret != 0) {
-            response->success = false;
-            response->message = "Failed to save map (ret=" + std::to_string(write_ret) + ") to " + pcd_path;
-            RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
-            return true;
-        }
+        pcd_writer.writeBinary(pcd_path, *filtered_map);
         
         response->success = true;
         response->message = "Successfully saved map with " + std::to_string(filtered_map->points.size()) + 
@@ -1899,116 +1829,39 @@ public:
         RCLCPP_INFO(this->get_logger(), "Filtered source cloud: %zu points, target cloud: %zu points",
                   source_filtered->points.size(), target_filtered->points.size());
         
-        if (source_filtered->empty() || target_filtered->empty()) {
-            RCLCPP_WARN(this->get_logger(), "Relocalization clouds are empty after filtering (src=%zu, tgt=%zu)",
-                        source_filtered->size(), target_filtered->size());
-            return false;
-        }
-
-        // Build a richer set of initial hypotheses for global relocalization:
-        // 1) identity-centered search for unknown starts
-        // 2) initial_pose-centered search when provided by config/launch
-        auto make_guess = [](float tx, float ty, float tz, float yaw_rad) {
-            Eigen::Matrix4f t = Eigen::Matrix4f::Identity();
-            const float c = std::cos(yaw_rad);
-            const float s = std::sin(yaw_rad);
-            t(0, 0) = c;  t(0, 1) = -s;
-            t(1, 0) = s;  t(1, 1) =  c;
-            t(0, 3) = tx;
-            t(1, 3) = ty;
-            t(2, 3) = tz;
-            return t;
-        };
-
+        // Define a list of initial transformations to try
+        // This helps ICP find the correct alignment even with large displacements
         std::vector<Eigen::Matrix4f> initial_transformations;
-        initial_transformations.reserve(512);
-
-        // Always include pure identity as a baseline.
-        initial_transformations.push_back(Eigen::Matrix4f::Identity());
-
-        // Symmetric XY offsets and yaw bins improve convergence when start is far from map origin.
-        const std::vector<float> offsets_xy = {-15.0f, -10.0f, -5.0f, 0.0f, 5.0f, 10.0f, 15.0f};
-        const std::vector<float> yaw_bins = {
-            -static_cast<float>(M_PI), -3.0f * static_cast<float>(M_PI) / 4.0f,
-            -static_cast<float>(M_PI) / 2.0f, -static_cast<float>(M_PI) / 4.0f,
-             0.0f,
-             static_cast<float>(M_PI) / 4.0f,  static_cast<float>(M_PI) / 2.0f,
-             3.0f * static_cast<float>(M_PI) / 4.0f
-        };
-
-        for (float dx : offsets_xy) {
-            for (float dy : offsets_xy) {
-                for (float yaw : yaw_bins) {
-                    initial_transformations.push_back(make_guess(dx, dy, 0.0f, yaw));
-                }
-            }
-        }
-
-        // If configured, also center hypotheses around mapping.initial_pose.
-        if (initial_pose.size() >= 7) {
-            const bool has_nondefault_seed =
-                std::fabs(initial_pose[0]) > 1e-6 ||
-                std::fabs(initial_pose[1]) > 1e-6 ||
-                std::fabs(initial_pose[2]) > 1e-6 ||
-                std::fabs(initial_pose[3] - 1.0) > 1e-6 ||
-                std::fabs(initial_pose[4]) > 1e-6 ||
-                std::fabs(initial_pose[5]) > 1e-6 ||
-                std::fabs(initial_pose[6]) > 1e-6;
-
-            if (!has_nondefault_seed) {
-                RCLCPP_INFO(this->get_logger(), "Skipping mapping.initial_pose seed because it is default identity.");
-            } else {
-            const float seed_x = static_cast<float>(initial_pose[0]);
-            const float seed_y = static_cast<float>(initial_pose[1]);
-            const float seed_z = static_cast<float>(initial_pose[2]);
-            Eigen::Quaternionf q_seed(
-                static_cast<float>(initial_pose[3]), // qw
-                static_cast<float>(initial_pose[4]), // qx
-                static_cast<float>(initial_pose[5]), // qy
-                static_cast<float>(initial_pose[6])  // qz
-            );
-            q_seed.normalize();
-            const float seed_yaw = std::atan2(
-                2.0f * (q_seed.w() * q_seed.z() + q_seed.x() * q_seed.y()),
-                1.0f - 2.0f * (q_seed.y() * q_seed.y() + q_seed.z() * q_seed.z())
-            );
-
-            // Try exact persisted/configured seed first (no perturbation), then expand around it.
-            initial_transformations.push_back(make_guess(seed_x, seed_y, seed_z, seed_yaw));
-
-            for (float dx : offsets_xy) {
-                for (float dy : offsets_xy) {
-                    for (float yaw : yaw_bins) {
-                        if (dx == 0.0f && dy == 0.0f && yaw == 0.0f) {
-                            continue; // already added as exact seed above
-                        }
-                        initial_transformations.push_back(
-                            make_guess(seed_x + dx, seed_y + dy, seed_z, seed_yaw + yaw));
-                    }
-                }
-            }
-
-            RCLCPP_INFO(this->get_logger(),
-                        "Using mapping.initial_pose seed [%.2f, %.2f, %.2f], yaw %.2f rad",
-                        seed_x, seed_y, seed_z, seed_yaw);
-            }
-        }
-
-        RCLCPP_INFO(this->get_logger(), "Relocalization ICP will evaluate %zu initial hypotheses",
-                    initial_transformations.size());
+        
+        // Add identity matrix (no transformation - default)
+        Eigen::Matrix4f identity = Eigen::Matrix4f::Identity();
+        initial_transformations.push_back(identity);
+        
+        // Add translation of 5m along X (forward)
+        Eigen::Matrix4f trans_5m_x = Eigen::Matrix4f::Identity();
+        trans_5m_x(0, 3) = 5.0;  // 5m in x direction
+        initial_transformations.push_back(trans_5m_x);
+        
+        // Add translation of 5m along Y (right)
+        Eigen::Matrix4f trans_5m_y = Eigen::Matrix4f::Identity();
+        trans_5m_y(1, 3) = 5.0;  // 5m in y direction
+        initial_transformations.push_back(trans_5m_y);
+        
+        // Add translation of -5m along Y (left)
+        Eigen::Matrix4f trans_neg_5m_y = Eigen::Matrix4f::Identity();
+        trans_neg_5m_y(1, 3) = -5.0;  // -5m in y direction
+        initial_transformations.push_back(trans_neg_5m_y);
+        
+        // Also try 10m in x direction (based on the screenshot showing ~10m displacement)
+        Eigen::Matrix4f trans_10m_x = Eigen::Matrix4f::Identity();
+        trans_10m_x(0, 3) = 10.0;
+        initial_transformations.push_back(trans_10m_x);
         
         // Store best result
         bool converged = false;
-        bool has_finite_candidate = false;
         float best_fitness_score = std::numeric_limits<float>::max();
         Eigen::Matrix4f best_transformation = Eigen::Matrix4f::Identity();
-        size_t best_guess_idx = 0;
-        size_t converged_count = 0;
         
-        // Strong-match shortcut: if a hypothesis converges with very low fitness,
-        // accept early instead of evaluating all hypotheses.
-        const float early_accept_fitness = static_cast<float>(relocalization_early_accept_fitness_);
-
         // Try each initial transformation
         for (size_t i = 0; i < initial_transformations.size(); i++) {
             // Perform ICP to find the transformation
@@ -2016,9 +1869,9 @@ public:
             // Increase max correspondence distance to handle larger displacements
             icp.setMaxCorrespondenceDistance(10.0);
             // Increase max iterations for more thorough alignment
-            icp.setMaximumIterations(300);
-            icp.setTransformationEpsilon(1e-4);
-            icp.setEuclideanFitnessEpsilon(1e-4);
+            icp.setMaximumIterations(200);
+            icp.setTransformationEpsilon(1e-6);
+            icp.setEuclideanFitnessEpsilon(1e-6);
             
             // Set initial transformation
             icp.setInputSource(source_filtered);
@@ -2027,10 +1880,7 @@ public:
             // Set initial alignment
             Eigen::Matrix4f init_guess = initial_transformations[i];
             
-            if (i % 25 == 0 || i + 1 == initial_transformations.size()) {
-                RCLCPP_INFO(this->get_logger(), "Trying initial transformation %zu/%zu",
-                            i + 1, initial_transformations.size());
-            }
+            RCLCPP_INFO(this->get_logger(), "Trying initial transformation #%zu", i);
             
             PointCloudXYZI::Ptr aligned(new PointCloudXYZI());
             icp.align(*aligned, init_guess);
@@ -2039,50 +1889,16 @@ public:
             RCLCPP_INFO(this->get_logger(), "Initial guess %zu: Converged=%d, Fitness score=%f", 
                        i, icp.hasConverged(), fitness_score);
             
-            if (icp.hasConverged()) {
-                converged_count++;
-            }
-
-            // Keep the best finite candidate even if PCL reports non-converged.
-            // On some platforms/settings, low-fitness results may still be usable.
-            if (std::isfinite(fitness_score) && fitness_score < best_fitness_score) {
-                has_finite_candidate = true;
-                converged = icp.hasConverged();
-                best_fitness_score = fitness_score;
-                best_transformation = icp.getFinalTransformation();
-                best_guess_idx = i;
-            }
-
-            if (icp.hasConverged() && std::isfinite(fitness_score) && fitness_score < early_accept_fitness) {
+            // Update best result if this one is better
+            if (icp.hasConverged() && fitness_score < best_fitness_score) {
                 converged = true;
-                has_finite_candidate = true;
                 best_fitness_score = fitness_score;
                 best_transformation = icp.getFinalTransformation();
-                best_guess_idx = i;
-                converged_count++;
-                RCLCPP_INFO(this->get_logger(),
-                            "Early accepting relocalization candidate at guess %zu with fitness %.6f",
-                            i, fitness_score);
-                break;
             }
         }
         
-        RCLCPP_INFO(this->get_logger(),
-                    "Relocalization ICP summary: converged=%zu/%zu, best_guess=%zu, best_score=%.6f, best_hasConverged=%d",
-                    converged_count, initial_transformations.size(), best_guess_idx, best_fitness_score, converged);
-
-        const bool accept_converged = converged && best_fitness_score < 5.0f;
-        const bool accept_low_fitness_fallback = has_finite_candidate && best_fitness_score < 2.5f;
-
-        // Accept either:
-        // 1) normal converged ICP with standard threshold, or
-        // 2) very low-fitness fallback (for platforms where hasConverged is unstable).
-        if (accept_converged || accept_low_fitness_fallback) {
-            if (!accept_converged && accept_low_fitness_fallback) {
-                RCLCPP_WARN(this->get_logger(),
-                            "Accepting relocalization by low-fitness fallback (score=%.6f) despite hasConverged=false",
-                            best_fitness_score);
-            }
+        // Check if any of the attempts converged with a good fitness score
+        if (converged && best_fitness_score < 5.0) {
             // Extract transformation parameters
             Eigen::Matrix3f rotation_matrix = best_transformation.block<3,3>(0,0);
             Eigen::Vector3f translation = best_transformation.block<3,1>(0,3);
@@ -2149,97 +1965,10 @@ public:
             
             return true;
         } else {
-            RCLCPP_WARN(this->get_logger(),
-                        "All ICP attempts rejected. Best fitness score: %f, best_hasConverged=%d",
-                        best_fitness_score, converged);
+            RCLCPP_WARN(this->get_logger(), "All ICP attempts failed to find a good match. Best fitness score: %f", 
+                       best_fitness_score);
             return false;
         }
-    }
-
-    void saveLastPoseTick()
-    {
-        // Persist only when we have a stable estimate.
-        if (!flg_EKF_inited) {
-            return;
-        }
-
-        if (last_pose_file_path_.empty()) {
-            return;
-        }
-
-        const std::string tmp_path = last_pose_file_path_ + ".tmp";
-        std::ofstream out(tmp_path, std::ios::out | std::ios::trunc);
-        if (!out.is_open()) {
-            RCLCPP_WARN(this->get_logger(), "Failed to open last pose temp file for write: %s", tmp_path.c_str());
-            return;
-        }
-
-        // Format: stamp_sec x y z qw qx qy qz map_path
-        out << std::fixed << std::setprecision(9)
-            << this->get_clock()->now().seconds() << " "
-            << state_point.pos(0) << " " << state_point.pos(1) << " " << state_point.pos(2) << " "
-            << state_point.rot.w() << " " << state_point.rot.x() << " "
-            << state_point.rot.y() << " " << state_point.rot.z() << " "
-            << loaded_map_path_ << "\n";
-        out.close();
-
-        std::error_code ec;
-        std::filesystem::rename(tmp_path, last_pose_file_path_, ec);
-        if (ec) {
-            RCLCPP_WARN(this->get_logger(), "Failed to replace last pose file: %s", ec.message().c_str());
-            std::filesystem::remove(tmp_path, ec);
-        }
-    }
-
-    bool loadLastPoseSeed()
-    {
-        if (!std::filesystem::exists(last_pose_file_path_)) {
-            RCLCPP_INFO(this->get_logger(), "No persisted last pose found at %s", last_pose_file_path_.c_str());
-            return false;
-        }
-
-        std::ifstream in(last_pose_file_path_);
-        if (!in.is_open()) {
-            RCLCPP_WARN(this->get_logger(), "Failed to open persisted pose file: %s", last_pose_file_path_.c_str());
-            return false;
-        }
-
-        double stamp_sec = 0.0;
-        double x = 0.0, y = 0.0, z = 0.0;
-        double qw = 1.0, qx = 0.0, qy = 0.0, qz = 0.0;
-        std::string saved_map_path;
-        in >> stamp_sec >> x >> y >> z >> qw >> qx >> qy >> qz >> saved_map_path;
-        if (!in.good() && !in.eof()) {
-            RCLCPP_WARN(this->get_logger(), "Persisted pose file parse failed: %s", last_pose_file_path_.c_str());
-            return false;
-        }
-
-        const double now_sec = this->get_clock()->now().seconds();
-        const double age_sec = std::max(0.0, now_sec - stamp_sec);
-        if (age_sec > last_pose_max_age_sec_) {
-            RCLCPP_WARN(this->get_logger(), "Persisted pose too old (%.1f sec > %.1f sec), ignoring.",
-                        age_sec, last_pose_max_age_sec_);
-            return false;
-        }
-
-        if (!loaded_map_path_.empty() && !saved_map_path.empty() && saved_map_path != loaded_map_path_) {
-            RCLCPP_WARN(this->get_logger(), "Persisted pose map mismatch, ignoring seed. saved=%s current=%s",
-                        saved_map_path.c_str(), loaded_map_path_.c_str());
-            return false;
-        }
-
-        Eigen::Quaterniond q(qw, qx, qy, qz);
-        if (!std::isfinite(q.norm()) || q.norm() < 1e-6) {
-            RCLCPP_WARN(this->get_logger(), "Persisted pose quaternion invalid, ignoring.");
-            return false;
-        }
-        q.normalize();
-
-        initial_pose = {x, y, z, q.w(), q.x(), q.y(), q.z()};
-        RCLCPP_INFO(this->get_logger(),
-                    "Loaded persisted initial pose seed: [%.2f, %.2f, %.2f], q=[%.4f, %.4f, %.4f, %.4f], age %.1f sec",
-                    x, y, z, q.w(), q.x(), q.y(), q.z(), age_sec);
-        return true;
     }
 
     void publishLocalMap() {
@@ -2671,13 +2400,6 @@ private:
     
     // Local map publishing
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLocalMap_;
-    rclcpp::TimerBase::SharedPtr pose_save_timer_;
-    std::string last_pose_file_path_;
-    std::string loaded_map_path_;
-    bool persist_last_pose_enabled_ = true;
-    double last_pose_save_interval_sec_ = 1.0;
-    double last_pose_max_age_sec_ = 1800.0;
-    double relocalization_early_accept_fitness_ = 2.0;
 };
 
 int main(int argc, char** argv)

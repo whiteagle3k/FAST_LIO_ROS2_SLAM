@@ -150,6 +150,29 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzitl,
     (uint8_t, line, line)
 )
 
+namespace lslidar_driver {
+
+    struct PointXYZIRT {
+        PCL_ADD_POINT4D;     // x, y, z 和 data[4]
+        PCL_ADD_INTENSITY;   // 强度
+        std::uint16_t ring;  // 线号
+        float time;          // 时间
+
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW  // 确保内存对齐
+    } EIGEN_ALIGN16;  // 强制 16 字节对齐
+
+}  // namespace lslidar_driver
+
+// 注册点云结构体
+POINT_CLOUD_REGISTER_POINT_STRUCT(lslidar_driver::PointXYZIRT,
+                                        (float, x, x)
+                                        (float, y, y)
+                                        (float, z, z)
+                                        (float, intensity, intensity)
+                                        (std::uint16_t, ring, ring)
+                                        (float, time, time))
+
+
 class Preprocess
 {
   public:

@@ -84,6 +84,12 @@ def generate_launch_description():
         condition=IfCondition(rviz_use)
     )
     """
+    
+    odometry_remapper_node = Node(
+        package="odometry_remapper",
+        executable="odometry_remapper",
+        namespace="",
+    )
 
     ld = LaunchDescription([
         #transform_map,
@@ -96,6 +102,7 @@ def generate_launch_description():
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_config_path_cmd)
 
+    ld.add_action(odometry_remapper_node)
     ld.add_action(fast_lio_node)
     # ld.add_action(rviz_node)
 
